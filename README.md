@@ -4,7 +4,12 @@ A Home Assistant add-on that emulates an SMA SunSpec-compatible inverter via Mod
 
 ## Why?
 
-Some energy management systems (e.g., Viessmann Gridbox) only discover inverters that speak **SunSpec Model 103** over Modbus TCP. Newer SMA inverters like the **Sunny Tripower X** only support **SunSpec 700** (DER models), which these systems don't understand.
+Some energy management systems only discover inverters that speak **SunSpec Model 103** over Modbus TCP. Newer SMA inverters like the **Sunny Tripower X** only support **SunSpec 700** (DER models), which these systems don't understand.
+
+Known affected systems:
+- **Viessmann Gridbox** (discontinued end of 2025)
+- **E.ON Home Manager** (successor, same hardware)
+- **gridX** energy management (powers both of the above)
 
 This add-on bridges the gap: it reads your inverter's data from Home Assistant sensors (via WebSocket) and serves it as a classic SunSpec Model 103 device on Modbus TCP port 502.
 
