@@ -18,6 +18,12 @@ This add-on bridges the gap: it reads your inverter's data from Home Assistant s
 - Responds on Modbus unit IDs 0, 1, 2, 3, and 247 (SMA broadcast)
 - Supports both FC3 (holding registers) and FC4 (input registers)
 
+## Prerequisites
+
+You need your SMA inverter's data available as Home Assistant sensors. For newer SMA inverters (Sunny Tripower X, Sunny Boy Smart Energy, etc.) using the ennexOS platform, the [SMA ennexOS](https://github.com/shadow578/homeassistant_sma-ennexos) HACS integration works well.
+
+Any other integration that provides AC power, voltage, current, frequency, and DC string data as HA sensors will also work.
+
 ## Installation
 
 1. Add this repository to your Home Assistant add-on store:
@@ -94,10 +100,10 @@ sensor_dc_w_b: "sensor.sma_stp_x_dc_power_b"
 ## How It Works
 
 ```
-┌──────────┐   Speedwire    ┌──────────────┐   WebSocket    ┌──────────────┐   Modbus TCP    ┌─────────┐
-│ SMA STP X├───────────────►│Home Assistant ├──────────────►│  SMA Modbus  ├───────────────►│ Gridbox │
-│ Inverter │                │  (sensors)   │               │    Proxy     │  :502          │  (EMS)  │
-└──────────┘                └──────────────┘               └──────────────┘                └─────────┘
+┌──────────┐  Speedwire  ┌────────────────┐  WebSocket  ┌──────────────┐  Modbus TCP  ┌─────────┐
+│ SMA STP X├────────────►│ Home Assistant  ├────────────►│  SMA Modbus  ├─────────────►│ Gridbox │
+│ Inverter │             │   (sensors)    │             │    Proxy     │  :502        │  (EMS)  │
+└──────────┘             └────────────────┘             └──────────────┘              └─────────┘
 ```
 
 1. Your inverter pushes data to Home Assistant (via Speedwire, Modbus, or any other integration)
