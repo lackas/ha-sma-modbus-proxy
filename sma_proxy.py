@@ -179,31 +179,47 @@ class SensorStore:
     def _refresh_registers(self):
         store = self.modbus_store
 
+        # Addressing note: pymodbus ModbusDeviceContext adds +1 internally in
+        # both setValues and getValues.  SunSpec registers use 1-based numbering
+        # (40001 = first register, wire address 40000), so we subtract 1 to
+        # convert to 0-based before pymodbus adds its +1.  SMA proprietary
+        # registers (30xxx/35xxx) use the raw address on the wire, so setValues
+        # +1 and getValues +1 cancel out — no correction needed.
+
         def w(addr, val):
+            """Write single SunSpec register (1-based addressing)."""
             store.setValues(3, addr - 1, [val & 0xFFFF])
 
         def w_s16(addr, val):
+            """Write signed int16 SunSpec register (1-based addressing)."""
             v = max(-32768, min(32767, int(val)))
             store.setValues(3, addr - 1, [v & 0xFFFF])
 
         def w_u32(addr, val):
+            """Write unsigned 32-bit SMA register (raw wire addressing)."""
             store.setValues(3, addr, _u32_words(val))
 
         def w_s32(addr, val):
+            """Write signed 32-bit SMA register (raw wire addressing)."""
             store.setValues(3, addr, _s32_words(val))
 
         # --- AC side ---
         power = self.get("power", 0)
         health = self.values.get("health")
 
+        # Determine operating state from health sensor and power output.
+        # health=None means no data yet (sleeping), string values like
+        # "unknown"/"unavailable" indicate a problem (fault).
         if health is None:
-            state = 2  # Sleeping
+            state = 2   # Sleeping — no data received yet
+        elif isinstance(health, str):
+            state = 1   # Fault — non-numeric health (unknown/unavailable/error)
         elif power > 0:
-            state = 4  # MPPT
+            state = 4   # MPPT — producing power
         else:
-            state = 3  # Standby
+            state = 3   # Standby — healthy but no production
 
-        sma_status = 307 if state == 4 else 303  # Ok / Aus
+        sma_status = {1: 35, 2: 303, 3: 303, 4: 307}.get(state, 303)  # Fehler/Aus/Ok
 
         # Currents (SF=-2)
         i_l1 = self.get("current_l1", 0)
@@ -392,8 +408,16 @@ async def ws_listener(ws_url: str, token: str, sensor_store: SensorStore,
                         continue
                     new_state = data.get("new_state", {})
                     value = new_state.get("state")
-                    if value not in (None, "unknown", "unavailable"):
-                        sensor_store.update(entity_to_key[entity_id], value)
+                    if value is None:
+                        continue
+                    key = entity_to_key[entity_id]
+                    if value in ("unknown", "unavailable"):
+                        # For health, propagate so the proxy can report fault state.
+                        # For other sensors, keep the last known value.
+                        if key == "health":
+                            sensor_store.update(key, value)
+                    else:
+                        sensor_store.update(key, value)
 
         except Exception as e:
             log.warning("WebSocket error: %s — reconnecting in 5s", e)
