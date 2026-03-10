@@ -139,6 +139,16 @@ Additionally, SMA proprietary registers are populated:
 - Temperature registers are not populated (reported as "not implemented" per SunSpec)
 - No write support — this is a read-only proxy
 
+## Adapting to Other Inverters
+
+While this add-on was built for an SMA Sunny Tripower X, it can serve as a template for making **any** inverter speak SunSpec Model 103 over Modbus TCP. As long as your inverter's data is available as Home Assistant sensors (via any integration), you can:
+
+1. Map your sensor entity IDs to the `sensor_*` options
+2. Adjust `serial` and `max_power_w` to match your inverter
+3. For single-string inverters, leave the `sensor_dc_*_b` fields empty
+
+The proxy doesn't care where the sensor data comes from — Speedwire, Modbus, cloud API, or even manual input. If Home Assistant has the sensors, this add-on can translate them into standard SunSpec registers.
+
 ## License
 
 MIT
