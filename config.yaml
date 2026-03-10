@@ -1,0 +1,58 @@
+name: SMA Modbus Proxy
+version: "1.0.4"
+slug: sma_modbus_proxy
+description: >-
+  Emulates an SMA SunSpec inverter via Modbus TCP using Home Assistant sensor data.
+  Makes non-SunSpec inverters (like SMA STP X with SunSpec 700 only) discoverable
+  by energy management systems that require SunSpec Model 103 (e.g., Viessmann Gridbox).
+url: "https://github.com/lackas/ha-sma-modbus-proxy"
+arch:
+  - aarch64
+  - amd64
+  - armv7
+host_network: true
+homeassistant_api: true
+options:
+  port: 502
+  ha_token: ""
+  serial: 1234567890
+  max_power_w: 12000
+  sensor_power: "sensor.sma_power"
+  sensor_current_l1: "sensor.sma_current_l1"
+  sensor_current_l2: "sensor.sma_current_l2"
+  sensor_current_l3: "sensor.sma_current_l3"
+  sensor_voltage_l1: "sensor.sma_voltage_l1"
+  sensor_voltage_l2: "sensor.sma_voltage_l2"
+  sensor_voltage_l3: "sensor.sma_voltage_l3"
+  sensor_frequency: "sensor.sma_frequency"
+  sensor_reactive: "sensor.sma_reactive_power"
+  sensor_yield_total: "sensor.sma_total_yield"
+  sensor_health: "sensor.sma_health"
+  sensor_dc_i_a: "sensor.sma_dc_current_a"
+  sensor_dc_v_a: "sensor.sma_dc_voltage_a"
+  sensor_dc_w_a: "sensor.sma_dc_power_a"
+  sensor_dc_i_b: "sensor.sma_dc_current_b"
+  sensor_dc_v_b: "sensor.sma_dc_voltage_b"
+  sensor_dc_w_b: "sensor.sma_dc_power_b"
+schema:
+  port: int
+  ha_token: str
+  serial: int
+  max_power_w: int
+  sensor_power: str
+  sensor_current_l1: str
+  sensor_current_l2: str
+  sensor_current_l3: str
+  sensor_voltage_l1: str
+  sensor_voltage_l2: str
+  sensor_voltage_l3: str
+  sensor_frequency: str
+  sensor_reactive: str
+  sensor_yield_total: str
+  sensor_health: str
+  sensor_dc_i_a: str
+  sensor_dc_v_a: str
+  sensor_dc_w_a: str
+  sensor_dc_i_b: str
+  sensor_dc_v_b: str
+  sensor_dc_w_b: str
