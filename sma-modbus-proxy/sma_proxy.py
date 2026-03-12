@@ -390,9 +390,9 @@ async def ws_listener(ws_url: str, token: str, sensor_store: SensorStore,
                 await ws.send(json.dumps({"id": states_id, "type": "get_states"}))
                 msg_id += 1
 
-                # Process responses — handle both subscription result and
-                # get_states result before entering the event loop
-                init_done = False
+                # Buffer trigger events until the initial snapshot is applied
+                # so a stale get_states payload can't overwrite fresher updates.
+                pending_updates = {}
                 async for raw in ws:
                     msg = json.loads(raw)
 
@@ -414,6 +414,14 @@ async def ws_listener(ws_url: str, token: str, sensor_store: SensorStore,
                                     val = s.get("state")
                                     sensor_store.update(key, val)
                                     log.info("  %s (%s) = %s", key, eid, val)
+                            for entity_id, value in pending_updates.items():
+                                key = entity_to_key[entity_id]
+                                if value in ("unknown", "unavailable"):
+                                    if key == "health":
+                                        sensor_store.update(key, value)
+                                else:
+                                    sensor_store.update(key, value)
+                            pending_updates = None
                             missing = [k for k in SENSOR_KEYS if sensor_store.values[k] is None]
                             if missing:
                                 log.warning("Missing sensors after init: %s", missing)
@@ -421,11 +429,8 @@ async def ws_listener(ws_url: str, token: str, sensor_store: SensorStore,
                                 log.info("All %d sensors loaded successfully", len(entity_ids))
                         else:
                             log.error("get_states failed: %s", msg)
-                        init_done = True
                         continue
 
-                    # Non-result messages before init is done — could be early
-                    # trigger events (the race we're closing)
                     if msg.get("type") != "event":
                         continue
 
@@ -436,6 +441,9 @@ async def ws_listener(ws_url: str, token: str, sensor_store: SensorStore,
                     to_state = variables.get("to_state", {})
                     value = to_state.get("state") if isinstance(to_state, dict) else None
                     if value is None:
+                        continue
+                    if pending_updates is not None:
+                        pending_updates[entity_id] = value
                         continue
                     key = entity_to_key[entity_id]
                     if value in ("unknown", "unavailable"):
@@ -510,7 +518,7 @@ def main():
              {v: k for k, v in entity_to_key.items()})
 
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
-    if supervisor_token and not args.ha_token:
+    if supervisor_token:
         ws_url = "ws://supervisor/core/websocket"
         token = supervisor_token
         log.info("Using Supervisor token (SUPERVISOR_TOKEN set), WS: %s", ws_url)
