@@ -483,6 +483,14 @@ def build_sensor_map(opts: dict) -> dict[str, str]:
     return sensors
 
 
+def _mask_token(token: str | None) -> str:
+    if not token:
+        return "missing"
+    if len(token) <= 8:
+        return f"{token[:2]}...({len(token)} chars)"
+    return f"{token[:4]}...{token[-4:]} ({len(token)} chars)"
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -512,12 +520,19 @@ def main():
     log.info("Tracking %d sensors: %s", len(entity_to_key),
              {v: k for k, v in entity_to_key.items()})
 
+    supervisor_env_keys = sorted(
+        key for key in os.environ if key.startswith(("SUPERVISOR", "HASSIO"))
+    )
+    log.info("Supervisor-related env vars: %s", supervisor_env_keys or "none")
+
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
     if supervisor_token:
+        log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
         ws_url = "ws://supervisor/core/websocket"
         token = supervisor_token
         log.info("Using Supervisor token (SUPERVISOR_TOKEN set), WS: %s", ws_url)
     else:
+        log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
         log.error("SUPERVISOR_TOKEN is not available. This add-on requires homeassistant_api access.")
         return
 

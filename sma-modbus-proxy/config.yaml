@@ -1,5 +1,5 @@
 name: SMA Modbus Proxy
-version: "1.1.1"
+version: "1.1.2"
 slug: sma_modbus_proxy
 description: >-
   Emulates an SMA SunSpec inverter via Modbus TCP using Home Assistant sensor data.
@@ -12,28 +12,29 @@ arch:
   - armv7
 init: false
 host_network: true
+hassio_api: true
 homeassistant_api: true
 options:
   port: 502
   serial: 1234567890
   max_power_w: 12000
-  sensor_power: "sensor.sma_power"
-  sensor_current_l1: "sensor.sma_current_l1"
-  sensor_current_l2: "sensor.sma_current_l2"
-  sensor_current_l3: "sensor.sma_current_l3"
-  sensor_voltage_l1: "sensor.sma_voltage_l1"
-  sensor_voltage_l2: "sensor.sma_voltage_l2"
-  sensor_voltage_l3: "sensor.sma_voltage_l3"
-  sensor_frequency: "sensor.sma_frequency"
-  sensor_reactive: "sensor.sma_reactive_power"
-  sensor_yield_total: "sensor.sma_total_yield"
-  sensor_health: "sensor.sma_health"
-  sensor_dc_i_a: "sensor.sma_dc_current_a"
-  sensor_dc_v_a: "sensor.sma_dc_voltage_a"
-  sensor_dc_w_a: "sensor.sma_dc_power_a"
-  sensor_dc_i_b: "sensor.sma_dc_current_b"
-  sensor_dc_v_b: "sensor.sma_dc_voltage_b"
-  sensor_dc_w_b: "sensor.sma_dc_power_b"
+  sensor_power: "sensor.lackas_measurement_gridms_totw"
+  sensor_current_l1: "sensor.lackas_measurement_gridms_a_phsa"
+  sensor_current_l2: "sensor.lackas_measurement_gridms_a_phsb"
+  sensor_current_l3: "sensor.lackas_measurement_gridms_a_phsc"
+  sensor_voltage_l1: "sensor.lackas_measurement_gridms_phv_phsa"
+  sensor_voltage_l2: "sensor.lackas_measurement_gridms_phv_phsb"
+  sensor_voltage_l3: "sensor.lackas_measurement_gridms_phv_phsc"
+  sensor_frequency: "sensor.lackas_measurement_gridms_hz"
+  sensor_reactive: "sensor.lackas_measurement_gridms_totvar"
+  sensor_yield_total: "sensor.lackas_measurement_metering_totwhout_pv"
+  sensor_health: "sensor.lackas_measurement_operation_health"
+  sensor_dc_i_a: "sensor.lackas_measurement_dcms_amp_0"
+  sensor_dc_v_a: "sensor.lackas_measurement_dcms_vol_0"
+  sensor_dc_w_a: "sensor.lackas_measurement_dcms_watt_0"
+  sensor_dc_i_b: "sensor.lackas_measurement_dcms_amp_1"
+  sensor_dc_v_b: "sensor.lackas_measurement_dcms_vol_1"
+  sensor_dc_w_b: "sensor.lackas_measurement_dcms_watt_1"
 schema:
   port: int
   serial: int
