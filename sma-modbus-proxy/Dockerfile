@@ -1,7 +1,8 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-RUN pip3 install --no-cache-dir pymodbus==3.12.1 websockets==14.2
+RUN apk add --no-cache python3 py3-pip && \
+    pip3 install --no-cache-dir --break-system-packages pymodbus==3.12.1 websockets==14.2
 
 COPY sma_proxy.py /
 COPY run.sh /

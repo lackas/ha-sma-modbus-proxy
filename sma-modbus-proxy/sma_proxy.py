@@ -355,65 +355,90 @@ async def ws_listener(ws_url: str, token: str, sensor_store: SensorStore,
     while True:
         try:
             log.info("Connecting to %s", ws_url)
-            headers = {"Authorization": f"Bearer {token}"}
-            async with websockets.connect(ws_url, additional_headers=headers) as ws:
+            async with websockets.connect(ws_url) as ws:
                 msg = json.loads(await ws.recv())
+                log.info("WS initial message: type=%s", msg.get("type"))
                 if msg.get("type") == "auth_required":
                     await ws.send(json.dumps({
                         "type": "auth",
                         "access_token": token,
                     }))
                     msg = json.loads(await ws.recv())
+                    log.info("WS auth response: type=%s", msg.get("type"))
                 if msg.get("type") != "auth_ok":
                     log.error("Auth failed: %s", msg)
                     await asyncio.sleep(10)
                     continue
                 log.info("Authenticated (HA %s)", msg.get("ha_version", "?"))
 
-                # Get current states
-                await ws.send(json.dumps({"id": msg_id, "type": "get_states"}))
-                msg_id += 1
-                states_msg = json.loads(await ws.recv())
-                if states_msg.get("type") == "result" and states_msg.get("success"):
-                    for s in states_msg.get("result", []):
-                        eid = s.get("entity_id")
-                        if eid in entity_to_key:
-                            sensor_store.update(entity_to_key[eid], s.get("state"))
-                    loaded = {
-                        k: sensor_store.values[k]
-                        for k in SENSOR_KEYS
-                        if sensor_store.values[k] is not None
-                    }
-                    log.info(
-                        "Loaded %d/%d sensors: %s", len(loaded), len(entity_ids),
-                        {k: v for k, v in loaded.items()
-                         if k in ("power", "dc_w_a", "dc_w_b", "yield_total", "health")},
-                    )
-
-                # Subscribe to state changes
+                # Subscribe first to avoid missing updates during get_states
+                sub_id = msg_id
+                log.info("Subscribing to %d entities...", len(entity_ids))
                 await ws.send(json.dumps({
-                    "id": msg_id,
-                    "type": "subscribe_events",
-                    "event_type": "state_changed",
+                    "id": sub_id,
+                    "type": "subscribe_trigger",
+                    "trigger": {
+                        "platform": "state",
+                        "entity_id": list(entity_ids),
+                    },
                 }))
                 msg_id += 1
 
+                # Then fetch current states as baseline
+                states_id = msg_id
+                log.info("Fetching initial states for %d entities...", len(entity_ids))
+                await ws.send(json.dumps({"id": states_id, "type": "get_states"}))
+                msg_id += 1
+
+                # Process responses — handle both subscription result and
+                # get_states result before entering the event loop
+                init_done = False
                 async for raw in ws:
                     msg = json.loads(raw)
+
+                    # Subscription confirmation
+                    if msg.get("type") == "result" and msg.get("id") == sub_id:
+                        if not msg.get("success"):
+                            log.error("Subscription failed: %s", msg)
+                        else:
+                            log.info("Subscription active")
+                        continue
+
+                    # Initial state load
+                    if msg.get("type") == "result" and msg.get("id") == states_id:
+                        if msg.get("success"):
+                            for s in msg.get("result", []):
+                                eid = s.get("entity_id")
+                                if eid in entity_to_key:
+                                    key = entity_to_key[eid]
+                                    val = s.get("state")
+                                    sensor_store.update(key, val)
+                                    log.info("  %s (%s) = %s", key, eid, val)
+                            missing = [k for k in SENSOR_KEYS if sensor_store.values[k] is None]
+                            if missing:
+                                log.warning("Missing sensors after init: %s", missing)
+                            else:
+                                log.info("All %d sensors loaded successfully", len(entity_ids))
+                        else:
+                            log.error("get_states failed: %s", msg)
+                        init_done = True
+                        continue
+
+                    # Non-result messages before init is done — could be early
+                    # trigger events (the race we're closing)
                     if msg.get("type") != "event":
                         continue
-                    data = msg.get("event", {}).get("data", {})
-                    entity_id = data.get("entity_id")
+
+                    variables = msg.get("event", {}).get("variables", {}).get("trigger", {})
+                    entity_id = variables.get("entity_id")
                     if entity_id not in entity_to_key:
                         continue
-                    new_state = data.get("new_state", {})
-                    value = new_state.get("state")
+                    to_state = variables.get("to_state", {})
+                    value = to_state.get("state") if isinstance(to_state, dict) else None
                     if value is None:
                         continue
                     key = entity_to_key[entity_id]
                     if value in ("unknown", "unavailable"):
-                        # For health, propagate so the proxy can report fault state.
-                        # For other sensors, keep the last known value.
                         if key == "health":
                             sensor_store.update(key, value)
                     else:
@@ -484,20 +509,24 @@ def main():
     log.info("Tracking %d sensors: %s", len(entity_to_key),
              {v: k for k, v in entity_to_key.items()})
 
-    if args.ha_token:
-        ha_url = args.ha_url or "http://supervisor/core"
-        ws_url = ha_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/websocket"
-        token = args.ha_token
-        log.info("Using configured token, WS: %s", ws_url)
-    else:
-        supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
-        if supervisor_token:
-            ws_url = "ws://supervisor/core/websocket"
-            token = supervisor_token
-            log.info("Using Supervisor token")
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+    if supervisor_token and not args.ha_token:
+        ws_url = "ws://supervisor/core/websocket"
+        token = supervisor_token
+        log.info("Using Supervisor token (SUPERVISOR_TOKEN set), WS: %s", ws_url)
+    elif args.ha_token:
+        if args.ha_url:
+            # Direct HA URL: ws://host:port/api/websocket
+            ws_url = args.ha_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/websocket"
         else:
-            log.error("No HA token available. Set ha_token in add-on config or run as HA add-on.")
-            return
+            # Inside add-on without SUPERVISOR_TOKEN: use Supervisor proxy
+            ws_url = "ws://supervisor/core/websocket"
+        token = args.ha_token
+        log.info("Using configured ha_token, WS: %s", ws_url)
+    else:
+        log.error("No HA token available. Set ha_token in add-on config or run as HA add-on.")
+        log.error("SUPERVISOR_TOKEN env: %s", "set" if os.environ.get("SUPERVISOR_TOKEN") else "NOT SET")
+        return
 
     regs = build_register_map(serial)
     block = ModbusSequentialDataBlock(0, [0] * 40001 + regs + [0] * 25000)
