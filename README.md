@@ -74,15 +74,12 @@ Map your inverter's Home Assistant sensor entities to the proxy's data fields. A
 | `port` | `502` | Modbus TCP port |
 | `serial` | `1234567890` | Emulated inverter serial number |
 | `max_power_w` | `12000` | Nominal max power (W) |
-| `ha_token` | `""` | HA long-lived access token (leave empty when running as add-on with `homeassistant_api: true`) |
-
 ### Example Configuration
 
 ```yaml
 port: 502
 serial: 1234567890
 max_power_w: 12000
-ha_token: ""
 sensor_power: "sensor.sma_stp_x_total_power"
 sensor_current_l1: "sensor.sma_stp_x_current_l1"
 sensor_current_l2: "sensor.sma_stp_x_current_l2"

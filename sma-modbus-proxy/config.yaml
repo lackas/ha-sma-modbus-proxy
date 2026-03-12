@@ -1,5 +1,5 @@
 name: SMA Modbus Proxy
-version: "1.1.0"
+version: "1.1.1"
 slug: sma_modbus_proxy
 description: >-
   Emulates an SMA SunSpec inverter via Modbus TCP using Home Assistant sensor data.
@@ -15,7 +15,6 @@ host_network: true
 homeassistant_api: true
 options:
   port: 502
-  ha_token: ""
   serial: 1234567890
   max_power_w: 12000
   sensor_power: "sensor.sma_power"
@@ -37,7 +36,6 @@ options:
   sensor_dc_w_b: "sensor.sma_dc_power_b"
 schema:
   port: int
-  ha_token: password
   serial: int
   max_power_w: int
   sensor_power: str
