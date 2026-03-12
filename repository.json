@@ -1,0 +1,5 @@
+{
+  "name": "SMA Modbus Proxy",
+  "url": "https://github.com/lackas/ha-sma-modbus-proxy",
+  "maintainer": "Christian Lackas <christian@lackas.net>"
+}
