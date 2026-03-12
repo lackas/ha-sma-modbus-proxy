@@ -5,7 +5,8 @@ Reads real data from Home Assistant via WebSocket (live state changes)
 and serves it via Modbus TCP so energy management systems (e.g., Viessmann
 Gridbox) can discover it as a supported SMA inverter.
 
-Designed to run as a Home Assistant add-on using the Supervisor WebSocket.
+Designed to run as a Home Assistant add-on using the Supervisor WebSocket,
+with an optional direct Home Assistant token fallback.
 """
 
 import argparse
@@ -499,6 +500,8 @@ def _mask_token(token: str | None) -> str:
 def main():
     parser = argparse.ArgumentParser(description="SMA Modbus TCP Proxy")
     parser.add_argument("--port", type=int, default=502)
+    parser.add_argument("--ha-url", default=None)
+    parser.add_argument("--ha-token", default=None)
     parser.add_argument("--options", default=None)
     args = parser.parse_args()
 
@@ -509,6 +512,8 @@ def main():
     if args.options and Path(args.options).exists():
         opts = json.loads(Path(args.options).read_text())
         args.port = opts.get("port", args.port)
+        if opts.get("ha_token"):
+            args.ha_token = opts["ha_token"]
         serial = opts.get("serial", serial)
         max_power_w = opts.get("max_power_w", max_power_w)
         entity_to_key = build_sensor_map(opts)
@@ -531,9 +536,15 @@ def main():
         ws_url = "ws://supervisor/core/websocket"
         token = supervisor_token
         log.info("Using Supervisor token (SUPERVISOR_TOKEN set), WS: %s", ws_url)
+    elif args.ha_token:
+        ha_url = args.ha_url or "http://homeassistant:8123"
+        ws_url = ha_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/websocket"
+        token = args.ha_token
+        log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
+        log.info("Using configured ha_token fallback, WS: %s", ws_url)
     else:
         log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
-        log.error("SUPERVISOR_TOKEN is not available. This add-on requires homeassistant_api access.")
+        log.error("No token available. Set ha_token in the add-on config or provide Supervisor access.")
         return
 
     regs = build_register_map(serial)
