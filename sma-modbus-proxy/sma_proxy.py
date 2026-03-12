@@ -531,17 +531,17 @@ def main():
     log.info("Supervisor-related env vars: %s", supervisor_env_keys or "none")
 
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
-    if supervisor_token:
-        log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
-        ws_url = "ws://supervisor/core/websocket"
-        token = supervisor_token
-        log.info("Using Supervisor token (SUPERVISOR_TOKEN set), WS: %s", ws_url)
-    elif args.ha_token:
+    if args.ha_token:
         ha_url = args.ha_url or "http://homeassistant:8123"
         ws_url = ha_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/websocket"
         token = args.ha_token
         log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
         log.info("Using configured ha_token fallback, WS: %s", ws_url)
+    elif supervisor_token:
+        log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
+        ws_url = "ws://supervisor/core/websocket"
+        token = supervisor_token
+        log.info("Using Supervisor token (SUPERVISOR_TOKEN set), WS: %s", ws_url)
     else:
         log.info("SUPERVISOR_TOKEN detected: %s", _mask_token(supervisor_token))
         log.error("No token available. Set ha_token in the add-on config or provide Supervisor access.")
