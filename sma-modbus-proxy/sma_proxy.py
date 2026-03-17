@@ -160,24 +160,50 @@ def _s32_words(val: float) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+class _ModbusTracker:
+    """Tracks Modbus client connections and read activity."""
+
+    def __init__(self):
+        self._clients_seen: set[str] = set()
+        self._read_count = 0
+        self._last_report_count = 0
+
+    def on_connect(self, connected: bool) -> None:
+        """Called by pymodbus trace_connect (True=connect, False=disconnect)."""
+        if connected:
+            log.info("Modbus client connected")
+        else:
+            log.info("Modbus client disconnected")
+
+    def on_read(self):
+        self._read_count += 1
+
+    def report(self):
+        """Called periodically to report activity."""
+        count = self._read_count
+        delta = count - self._last_report_count
+        self._last_report_count = count
+        if count == 0:
+            log.info("Modbus: no reads received yet — waiting for client")
+        else:
+            log.info("Modbus: %d reads total (%d since last report)", count, delta)
+
+
+_modbus_tracker = _ModbusTracker()
+
+
 class _TrackingDeviceContext(ModbusDeviceContext):
-    """Wraps ModbusDeviceContext to log Modbus client activity."""
+    """Wraps ModbusDeviceContext to log first Modbus read per startup."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._read_count = 0
-        self._last_log_time = 0
+        self._first_read_logged = False
 
     def getValues(self, fc_as_hex, address, count=1):
-        self._read_count += 1
-        now = time.monotonic()
-        if self._read_count == 1:
-            log.info("First Modbus read received (addr=%d, count=%d) — client connected", address, count)
-        elif now - self._last_log_time >= 300:
-            log.info("Modbus client active: %d reads since startup", self._read_count)
-            self._last_log_time = now
-        if self._read_count == 1:
-            self._last_log_time = now
+        _modbus_tracker.on_read()
+        if not self._first_read_logged:
+            self._first_read_logged = True
+            log.info("First Modbus read (addr=%d, count=%d) — client polling", address, count)
         return super().getValues(fc_as_hex, address, count)
 
 
@@ -583,8 +609,19 @@ def main():
 
     start_ws_thread(ws_url, token, sensor_store, entity_to_key)
 
+    def modbus_reporter():
+        while True:
+            time.sleep(300)
+            _modbus_tracker.report()
+
+    threading.Thread(target=modbus_reporter, daemon=True).start()
+
     log.info("Starting Modbus TCP on port %d (serial: %d, max: %dW)", args.port, serial, max_power_w)
-    StartTcpServer(context=context, address=("0.0.0.0", args.port))
+    StartTcpServer(
+        context=context,
+        address=("0.0.0.0", args.port),
+        trace_connect=_modbus_tracker.on_connect,
+    )
 
 
 if __name__ == "__main__":
