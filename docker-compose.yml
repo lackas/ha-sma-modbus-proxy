@@ -1,0 +1,9 @@
+services:
+  sma-modbus-proxy:
+    build: sma-modbus-proxy
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - INVERTER_IP=192.168.1.216
+      - SERIAL=1234567890
+      - MAX_POWER_W=12000
