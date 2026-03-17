@@ -260,7 +260,7 @@ class SensorStore:
         # "unknown"/"unavailable" indicate a problem (fault).
         if health is None:
             state = 2   # Sleeping — no data received yet
-        elif isinstance(health, str):
+        elif isinstance(health, str) and health.lower() != "ok":
             state = 1   # Fault — non-numeric health (unknown/unavailable/error)
         elif power > 0:
             state = 4   # MPPT — producing power
@@ -531,13 +531,6 @@ def build_sensor_map(opts: dict) -> dict[str, str]:
             sensors[entity_id] = key
     return sensors
 
-
-def _mask_token(token: str | None) -> str:
-    if not token:
-        return "missing"
-    if len(token) <= 8:
-        return f"{token[:2]}...({len(token)} chars)"
-    return f"{token[:4]}...{token[-4:]} ({len(token)} chars)"
 
 
 # ---------------------------------------------------------------------------
