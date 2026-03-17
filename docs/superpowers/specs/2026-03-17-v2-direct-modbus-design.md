@@ -123,7 +123,7 @@ Carried over from v1.1.9:
 - Modbus client connect/disconnect via `trace_connect`
 - First Modbus read from Gridbox
 - Periodic (5 min) Modbus read count
-- Periodic AC/DC status summary (every 50th poll)
+- Periodic AC/DC status summary (every 60th poll, ~1 min)
 - Inverter connection errors and reconnects
 
 New in v2:
