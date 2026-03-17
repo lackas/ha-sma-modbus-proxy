@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 from pymodbus.datastore import ModbusDeviceContext, ModbusServerContext, ModbusSequentialDataBlock
@@ -157,6 +158,27 @@ def _s32_words(val: float) -> list[int]:
 # ---------------------------------------------------------------------------
 # Sensor state store + Modbus updater
 # ---------------------------------------------------------------------------
+
+
+class _TrackingDeviceContext(ModbusDeviceContext):
+    """Wraps ModbusDeviceContext to log Modbus client activity."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._read_count = 0
+        self._last_log_time = 0
+
+    def getValues(self, fc_as_hex, address, count=1):
+        self._read_count += 1
+        now = time.monotonic()
+        if self._read_count == 1:
+            log.info("First Modbus read received (addr=%d, count=%d) — client connected", address, count)
+        elif now - self._last_log_time >= 300:
+            log.info("Modbus client active: %d reads since startup", self._read_count)
+            self._last_log_time = now
+        if self._read_count == 1:
+            self._last_log_time = now
+        return super().getValues(fc_as_hex, address, count)
 
 
 class SensorStore:
@@ -522,16 +544,9 @@ def main():
         log.error("No sensor entity IDs configured. Set sensor_* options in the add-on config.")
         return
 
-    log.info("Tracking %d sensors: %s", len(entity_to_key),
-             {v: k for k, v in entity_to_key.items()})
-
-    supervisor_env_keys = sorted(
-        key for key in os.environ if key.startswith(("SUPERVISOR", "HASSIO"))
-    )
-    log.info("Supervisor-related env vars: %s", supervisor_env_keys or "none")
+    log.info("Tracking %d sensors", len(entity_to_key))
 
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
-    log.info("SUPERVISOR_TOKEN: %s", "available" if supervisor_token else "not set")
     if supervisor_token:
         ws_url = "ws://supervisor/core/websocket"
         token = supervisor_token
@@ -547,7 +562,7 @@ def main():
 
     regs = build_register_map(serial)
     block = ModbusSequentialDataBlock(0, [0] * 40001 + regs + [0] * 25000)
-    store = ModbusDeviceContext(hr=block, ir=block)
+    store = _TrackingDeviceContext(hr=block, ir=block)
 
     # Static SMA identification registers
     store.setValues(3, 30003, [0, 378])                                    # SusyID
