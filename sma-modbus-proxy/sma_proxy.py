@@ -415,6 +415,8 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
     client = None
     error_backoff = POLL_ERROR_MIN
     prev_interval = None
+    was_throttled = False
+    throttle_start = 0
 
     while True:
         if client is None:
@@ -448,6 +450,16 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
 
         # Reset error backoff on success
         error_backoff = POLL_ERROR_MIN
+
+        # Throttle detection
+        if state == 5 and not was_throttled:
+            log.warning("Inverter throttled (state=5)")
+            was_throttled = True
+            throttle_start = time.monotonic()
+        elif state != 5 and was_throttled:
+            duration = time.monotonic() - throttle_start
+            log.info("Inverter no longer throttled (state=%d) — was throttled for %ds", state, int(duration))
+            was_throttled = False
 
         # Adaptive poll interval: 1s when producing, 60s on standby/night
         if state == 4 or state == 5:  # MPPT or Throttled
