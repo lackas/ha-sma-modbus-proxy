@@ -245,7 +245,8 @@ def poll_inverter(client: ModbusTcpClient, store: ModbusDeviceContext,
     # Fixed block: m[2]=DCA_SF, m[3]=DCV_SF, m[4]=DCW_SF, m[5]=DCWH_SF
     # m[6-7]=Evt, m[8]=N, m[9]=TmsPer
     # Repeating blocks start at m[10], 20 regs each
-    m160_dca_sf = _sf(m[2])
+    # Block layout: ID(1) + IDStr(8 regs) + DCA(1) + DCV(1) + DCW(1) + DCWH(2) +
+    #               Tmp(1) + DCSt(1) + DCEvt(2) + pad(2) = 20 regs
     m160_dcv_sf = _sf(m[3])
     m160_dcw_sf = _sf(m[4])
     n_modules = min(m[8], 3)
@@ -254,9 +255,9 @@ def poll_inverter(client: ModbusTcpClient, store: ModbusDeviceContext,
     for i in range(n_modules):
         base = 10 + i * 20
         mppt.append({
-            "i": _safe_u16(m[base + 5]) * 10**m160_dca_sf,
-            "v": _safe_u16(m[base + 6]) * 10**m160_dcv_sf,
-            "w": _safe_s16(m[base + 7]) * 10**m160_dcw_sf,
+            "i": _safe_u16(m[base + 9]) * 0.1,  # DCA in 0.1A (DCA_SF not-impl, empirically SF=-1)
+            "v": _safe_u16(m[base + 10]) * 10**m160_dcv_sf,
+            "w": _safe_s16(m[base + 11]) * 10**m160_dcw_sf,
         })
 
     # Pad to 3 entries

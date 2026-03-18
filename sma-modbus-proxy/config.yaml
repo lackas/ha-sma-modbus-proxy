@@ -1,5 +1,5 @@
 name: SMA Modbus Proxy
-version: "2.0.1"
+version: "2.0.2"
 slug: sma_modbus_proxy
 description: >-
   Modbus TCP proxy for SMA SunSpec inverters. Reads SunSpec Model 103/160
