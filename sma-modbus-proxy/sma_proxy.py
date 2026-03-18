@@ -181,19 +181,19 @@ def poll_inverter(client: ModbusTcpClient, store: ModbusDeviceContext,
                   poll_count: list[int]):
     """Read inverter registers and update the Modbus server store.
 
-    Returns True on success, False on error.
+    Returns the SunSpec operating state on success (>= 0), or -1 on error.
     """
     # --- Read Model 103 (50 data registers) ---
     r103 = client.read_holding_registers(MODEL_103_ADDR, count=50, device_id=INVERTER_UNIT_ID)
     if r103.isError():
         log.warning("Failed to read Model 103: %s", r103)
-        return False
+        return -1
 
     # --- Read Model 160 (header + data, 70 registers) ---
     r160 = client.read_holding_registers(MODEL_160_ADDR, count=70, device_id=INVERTER_UNIT_ID)
     if r160.isError():
         log.warning("Failed to read Model 160: %s", r160)
-        return False
+        return -1
 
     d = r103.registers
     m = r160.registers
@@ -397,43 +397,66 @@ def poll_inverter(client: ModbusTcpClient, store: ModbusDeviceContext,
             int(dc_w_total), total_wh_int, state, sma_status,
         )
 
-    return True
+    return state
+
+
+POLL_ACTIVE = 1       # Producing power: poll every 1s
+POLL_STANDBY = 60     # Standby/night: poll every 60s
+POLL_ERROR_MIN = 5    # First error retry: 5s
+POLL_ERROR_MAX = 300  # Max error backoff: 5 min
 
 
 def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
     """Continuously poll the inverter and update the register map."""
     poll_count = [0]
     client = None
+    error_backoff = POLL_ERROR_MIN
+    prev_interval = None
 
     while True:
         if client is None:
             log.info("Connecting to inverter at %s:502 (unit %d)", inverter_ip, INVERTER_UNIT_ID)
             client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
             if not client.connect():
-                log.warning("Cannot reach inverter at %s — retrying in 5s", inverter_ip)
+                log.warning("Cannot reach inverter at %s — retrying in %ds", inverter_ip, error_backoff)
                 client = None
-                time.sleep(5)
+                time.sleep(error_backoff)
+                error_backoff = min(error_backoff * 2, POLL_ERROR_MAX)
                 continue
             log.info("Connected to inverter at %s", inverter_ip)
+            error_backoff = POLL_ERROR_MIN
 
         try:
-            if not poll_inverter(client, store, poll_count):
-                log.warning("Poll failed — reconnecting in 5s")
-                client.close()
-                client = None
-                time.sleep(5)
-                continue
+            state = poll_inverter(client, store, poll_count)
         except Exception as e:
-            log.warning("Poll error: %s — reconnecting in 5s", e)
+            state = -1
+            log.warning("Poll error: %s", e)
+
+        if state < 0:
+            log.warning("Poll failed — retrying in %ds", error_backoff)
             try:
                 client.close()
             except Exception:
                 pass
             client = None
-            time.sleep(5)
+            time.sleep(error_backoff)
+            error_backoff = min(error_backoff * 2, POLL_ERROR_MAX)
             continue
 
-        time.sleep(1)
+        # Reset error backoff on success
+        error_backoff = POLL_ERROR_MIN
+
+        # Adaptive poll interval: 1s when producing, 60s on standby/night
+        if state == 4 or state == 5:  # MPPT or Throttled
+            interval = POLL_ACTIVE
+        else:
+            interval = POLL_STANDBY
+
+        if interval != prev_interval:
+            log.info("Poll interval: %ds (state=%d)", interval, state)
+            prev_interval = interval
+
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------------------

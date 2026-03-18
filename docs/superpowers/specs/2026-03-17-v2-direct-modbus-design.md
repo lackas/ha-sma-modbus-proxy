@@ -60,10 +60,23 @@ Two Modbus reads per poll cycle from the inverter (unit 126). All addresses belo
 
 | Read | Address (1-based) | Count | Content | Frequency |
 |------|-------------------|-------|---------|-----------|
-| Model 103 data | 41259 | 50 | AC: power, current, voltage, freq, yield, DC summary | Every 1s |
-| Model 160 (header+data) | 41415 | 70 | Per-MPPT DC: 3 strings, current/voltage/power/energy | Every 1s |
+| Model 103 data | 41259 | 50 | AC: power, current, voltage, freq, yield, DC summary | Adaptive |
+| Model 160 (header+data) | 41415 | 70 | Per-MPPT DC: 3 strings, current/voltage/power/energy | Adaptive |
 
 Measured read latency: ~18ms for both reads combined.
+
+### Adaptive Poll Interval
+
+The poll frequency adapts to the inverter's operating state:
+- **1s** when producing power (MPPT/Throttled, state 4/5)
+- **60s** on standby/night (state 0/1/2/3/6/7)
+- Log message on interval change: `Poll interval: Xs (state=Y)`
+
+### Error Backoff
+
+On poll failure or connection loss, the proxy uses exponential backoff:
+- Starts at 5s, doubles each failure, caps at 5 minutes (300s)
+- Resets to 5s on first successful poll
 
 The proxy **parses** the raw register values (applying scale factors), replaces 0xFFFF/0x8000 "not implemented" markers with 0, and **re-packs** them into the standard Model 103 address range (40073+). This is not a raw byte-copy because:
 1. We need the parsed values to compute SMA proprietary registers (30xxx/35xxx)
@@ -140,8 +153,8 @@ New in v2:
 - **Missing `inverter_ip`**: log error and exit at startup
 - **Invalid `inverter_ip`**: connection fails, retry loop with 5s backoff
 
-- **Inverter unreachable at startup**: retry every 5s, log warning
-- **Inverter unreachable during operation**: serve last known values, log warning, retry next cycle
+- **Inverter unreachable at startup**: exponential backoff 5s → 10s → 20s → ... → 300s max
+- **Inverter unreachable during operation**: serve last known values, exponential backoff, reset on success
 - **Inverter returns errors for specific registers**: serve zeros for those registers
 - **Gridbox connects before first successful poll**: serve zeros (same as v1 startup behavior)
 
