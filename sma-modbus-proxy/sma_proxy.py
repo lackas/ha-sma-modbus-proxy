@@ -31,6 +31,8 @@ logging.getLogger("pymodbus.logging").addFilter(_SkipSetValues())
 logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 
+VERSION = "2.0.3"
+
 # Inverter Modbus settings
 INVERTER_UNIT_ID = 126
 MODEL_103_ADDR = 41258    # 0-based wire address for Model 103 data (1-based: 41259)
@@ -538,7 +540,7 @@ def main():
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
         return
 
-    log.info("SMA Modbus Proxy v2.0")
+    log.info("SMA Modbus Proxy v%s", VERSION)
     log.info("Inverter: %s, Serial: %d, Max power: %dW", inverter_ip, serial, max_power_w)
 
     regs = build_register_map(serial)
