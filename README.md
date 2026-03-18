@@ -1,35 +1,33 @@
 # SMA Modbus Proxy — Home Assistant Add-on
 
-A Home Assistant add-on that emulates an SMA SunSpec-compatible inverter via Modbus TCP, using live sensor data from Home Assistant.
+A Modbus TCP proxy that reads SunSpec registers directly from an SMA inverter and serves them at standard addresses for energy management systems.
 
 ## Why?
 
-Some energy management systems only discover inverters that speak **SunSpec Model 103** over Modbus TCP. Newer SMA inverters like the **Sunny Tripower X** (ennexOS platform) only support **SunSpec 700** (DER models), which these systems don't understand.
+Some energy management systems only discover inverters that speak **SunSpec Model 103** at the standard register position. Newer SMA inverters like the **Sunny Tripower X** (ennexOS platform) serve Model 103 deep in a long SunSpec model chain (address 41257, unit ID 126) where these systems can't find it.
 
 Known affected systems:
-- **Viessmann Gridbox** (discontinued end of 2025)
+- **Viessmann Gridbox**
 - **E.ON Home Manager** (successor, same hardware)
 - **gridX** energy management (powers both of the above)
 
-This add-on bridges the gap: it reads your inverter's data from Home Assistant sensors (via WebSocket) and serves it as a classic SunSpec Model 103 device on Modbus TCP port 502.
+This add-on bridges the gap: it polls your inverter directly via Modbus TCP every second and serves the data at the standard SunSpec addresses (40071+, unit ID 1/3).
 
 ## Features
 
-- Full **SunSpec Model 103** (Three Phase Inverter) register map
+- **Direct Modbus polling** — reads from the inverter every 1s (~18ms per cycle)
+- Full **SunSpec Model 103** (Three Phase Inverter) at standard addresses
 - **SMA proprietary registers** (30xxx/35xxx) for maximum compatibility
-- Live data via Home Assistant **WebSocket API** (sub-second updates)
-- Configurable sensor entity mapping — works with any inverter that has HA sensors
-- Supports dual MPPT strings (DC side)
-- Responds on Modbus unit IDs 0, 1, 2, 3, and 247 (SMA broadcast)
-- Supports both FC3 (holding registers) and FC4 (input registers)
-
-## Prerequisites
-
-You need your SMA inverter's data available as Home Assistant sensors. For newer SMA inverters (Sunny Tripower X, Sunny Boy Smart Energy, etc.) using the ennexOS platform, the [SMA ennexOS](https://github.com/shadow578/homeassistant_sma-ennexos) HACS integration works well.
-
-Any other integration that provides AC power, voltage, current, frequency, and DC string data as HA sensors will also work.
+- **3 MPPT strings** from SunSpec Model 160
+- **Adaptive polling** — 1s when producing, 60s on standby/night
+- **Exponential backoff** on connection errors (5s to 5min)
+- Throttle detection (SunSpec state 5) with duration logging
+- Responds on Modbus unit IDs 0, 1, 2, 3, and 247
+- No HA API dependency — communicates directly with the inverter
 
 ## Installation
+
+### Home Assistant Add-on
 
 1. Add this repository to your Home Assistant add-on store:
    - Go to **Settings → Add-ons → Add-on Store → ⋮ → Repositories**
@@ -37,121 +35,92 @@ Any other integration that provides AC power, voltage, current, frequency, and D
 
 2. Install "SMA Modbus Proxy" from the store
 
-3. Configure the add-on (see below)
+3. Configure the add-on with your inverter's IP address
 
 4. Start the add-on
 
+### Standalone Docker
+
+```bash
+docker compose up -d
+```
+
+Edit `docker-compose.yml` to set your inverter IP:
+
+```yaml
+environment:
+  - INVERTER_IP=192.168.1.216
+  - SERIAL=1234567890
+  - MAX_POWER_W=12000
+```
+
 ## Configuration
-
-### Required: Sensor Entity IDs
-
-Map your inverter's Home Assistant sensor entities to the proxy's data fields. All `sensor_*` options accept a Home Assistant entity ID.
-
-**AC side:**
-
-| Option | Description | Unit |
-|--------|-------------|------|
-| `sensor_power` | Total AC active power | W |
-| `sensor_current_l1/l2/l3` | AC current per phase | A |
-| `sensor_voltage_l1/l2/l3` | AC voltage per phase | V |
-| `sensor_frequency` | Grid frequency | Hz |
-| `sensor_reactive` | Reactive power | var |
-| `sensor_yield_total` | Total energy yield | Wh |
-| `sensor_health` | Inverter health/status | — |
-
-**DC side (per MPPT string):**
-
-| Option | Description | Unit |
-|--------|-------------|------|
-| `sensor_dc_i_a` / `sensor_dc_i_b` | DC current string A/B | A |
-| `sensor_dc_v_a` / `sensor_dc_v_b` | DC voltage string A/B | V |
-| `sensor_dc_w_a` / `sensor_dc_w_b` | DC power string A/B | W |
-
-### Other Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `port` | `502` | Modbus TCP port |
-| `ha_token` | `""` | Optional HA long-lived access token fallback if Supervisor access is unavailable |
+| `inverter_ip` | `""` | IP address of the SMA inverter (required) |
 | `serial` | `1234567890` | Emulated inverter serial number |
-| `max_power_w` | `12000` | Nominal max power (W) |
-### Example Configuration
-
-```yaml
-port: 502
-ha_token: ""
-serial: 1234567890
-max_power_w: 12000
-sensor_power: "sensor.sma_stp_x_total_power"
-sensor_current_l1: "sensor.sma_stp_x_current_l1"
-sensor_current_l2: "sensor.sma_stp_x_current_l2"
-sensor_current_l3: "sensor.sma_stp_x_current_l3"
-sensor_voltage_l1: "sensor.sma_stp_x_voltage_l1"
-sensor_voltage_l2: "sensor.sma_stp_x_voltage_l2"
-sensor_voltage_l3: "sensor.sma_stp_x_voltage_l3"
-sensor_frequency: "sensor.sma_stp_x_frequency"
-sensor_reactive: "sensor.sma_stp_x_reactive_power"
-sensor_yield_total: "sensor.sma_stp_x_total_yield"
-sensor_health: "sensor.sma_stp_x_health"
-sensor_dc_i_a: "sensor.sma_stp_x_dc_current_a"
-sensor_dc_v_a: "sensor.sma_stp_x_dc_voltage_a"
-sensor_dc_w_a: "sensor.sma_stp_x_dc_power_a"
-sensor_dc_i_b: "sensor.sma_stp_x_dc_current_b"
-sensor_dc_v_b: "sensor.sma_stp_x_dc_voltage_b"
-sensor_dc_w_b: "sensor.sma_stp_x_dc_power_b"
-```
+| `max_power_w` | `12000` | Nominal max power (W) for SMA registers 30231/30233 |
 
 ## How It Works
 
 ```
-┌──────────┐  Speedwire  ┌────────────────┐  WebSocket  ┌──────────────┐  Modbus TCP  ┌─────────┐
-│ SMA STP X├────────────►│ Home Assistant  ├────────────►│  SMA Modbus  ├─────────────►│ Gridbox │
-│ Inverter │             │   (sensors)    │             │    Proxy     │  :502        │  (EMS)  │
-└──────────┘             └────────────────┘             └──────────────┘              └─────────┘
+┌──────────┐  Modbus TCP   ┌──────────────┐  Modbus TCP   ┌─────────┐
+│ SMA STP X├◄── poll 1s ───┤  SMA Modbus  ├◄── poll ~1s ──┤ Gridbox │
+│ Inverter │  unit 126     │    Proxy     │  unit 1/3     │  (EMS)  │
+│ :502     │  addr 41257+  │  (add-on)   │  addr 40071+  │         │
+└──────────┘               │  :502       │               └─────────┘
+                           └──────────────┘
 ```
 
-1. Your inverter pushes data to Home Assistant (via Speedwire, Modbus, or any other integration)
-2. The proxy subscribes to sensor state changes via the HA WebSocket API
-3. On each update, it writes the values into a SunSpec-compatible Modbus register map
-4. The energy management system reads these registers via standard Modbus TCP
+1. The proxy connects to the inverter via Modbus TCP and polls SunSpec Model 103 (50 regs) + Model 160 (70 regs) every second
+2. It parses the values, applies scale factors, replaces nighttime "not implemented" markers with zeros
+3. It writes them to a standard SunSpec register map at the addresses the Gridbox expects
+4. It also computes SMA proprietary registers (30xxx/35xxx) from the SunSpec data
+5. The energy management system reads these registers via standard Modbus TCP
 
 ## SunSpec Register Map
 
-The proxy implements the following SunSpec models:
+The proxy serves the following:
 
-- **Model 1** (Common): Manufacturer, model, serial, firmware version (registers 40003–40070)
-- **Model 103** (Three Phase Inverter): AC/DC measurements, operating state (registers 40071–40122)
+**SunSpec models:**
+- **Model 1** (Common): Manufacturer, model, serial, firmware version (40003–40070)
+- **Model 103** (Three Phase Inverter): AC/DC measurements, operating state (40071–40122)
 
-Additionally, SMA proprietary registers are populated:
-
+**SMA proprietary registers:**
 - **30003–30233**: Device identification, serial, device class, max power
 - **30531**: Total yield
 - **30769–30797**: AC power, voltages, frequency, reactive power
-- **30803–30815**: DC per-string measurements
+- **30803–30815**: DC per-string measurements (2 strings)
 - **30835**: Operating status
-- **35377–35387**: MPPT tracker data
+- **35377–35393**: MPPT tracker data (3 strings)
 
-## Requirements
+## Log Output
 
-- Home Assistant with the inverter's sensors available
-- The add-on needs `host_network: true` to be reachable on port 502
-- Python packages: `pymodbus`, `websockets` (installed automatically in the Docker image)
+```
+SMA Modbus Proxy v2.0.3
+Inverter: 192.168.1.216, Serial: 1234567890, Max power: 12000W
+Connected to inverter at 192.168.1.216
+Poll interval: 1s (state=4)
+AC: P=2350W VA=2450VA PF=-1.00 V=227/227/228V I=3.6/3.6/3.6A Hz=50.04
+DC: A=1830W(3.9A/471V) B=590W(1.5A/387V) C=0W(0.0A/0V) Tot=2420W Yield=205600Wh St=4(307)
+Modbus client connected
+First Modbus read (addr=30053, count=2) — client polling
+Modbus: 255 reads total (255 since last report)
+```
+
+## Verified With
+
+- **Inverter**: SMA Sunny Tripower X 12 (STP 12-50), firmware 03.14.22.R
+- **EMS**: Viessmann Gridbox (gridX platform)
+- **SunSpec**: Model 103 at address 41257, Model 160 at 41415, unit ID 126
 
 ## Limitations
 
-- Emulates a single three-phase inverter (STP 10.0-3AV-40 identity)
-- Temperature registers are not populated (reported as "not implemented" per SunSpec)
-- No write support — this is a read-only proxy
-
-## Adapting to Other Inverters
-
-While this add-on was built for an SMA Sunny Tripower X, it can serve as a template for making **any** inverter speak SunSpec Model 103 over Modbus TCP. As long as your inverter's data is available as Home Assistant sensors (via any integration), you can:
-
-1. Map your sensor entity IDs to the `sensor_*` options
-2. Adjust `serial` and `max_power_w` to match your inverter
-3. For single-string inverters, leave the `sensor_dc_*_b` fields empty
-
-The proxy doesn't care where the sensor data comes from — Speedwire, Modbus, cloud API, or even manual input. If Home Assistant has the sensors, this add-on can translate them into standard SunSpec registers.
+- Designed for SMA Sunny Tripower X (ennexOS) — other SMA inverters may use different register addresses or unit IDs
+- Emulates STP 10.0-3AV-40 identity (required for Gridbox discovery)
+- Temperature registers are not populated (SunSpec "not implemented")
+- No write support — read-only proxy
 
 ## License
 
