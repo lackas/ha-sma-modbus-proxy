@@ -1,7 +1,8 @@
-## 2.0.4
-- Auto-detect serial number and max power from inverter at startup
-- Remove serial and max_power_w from add-on config (only inverter_ip remains)
-- Retry with exponential backoff if inverter unreachable during identity read
+## 2.0.5
+- Auto-detect serial number from inverter (SunSpec Common model)
+- Auto-detect max power from inverter (SunSpec Model 120 WRtg)
+- Remove serial and max_power_w from config (auto-detected, fall back to defaults)
+- Add device_identifier config option (default "STP 10.0-3AV-40") for faked model name
 
 ## 2.0.3
 - Show actual version in log output

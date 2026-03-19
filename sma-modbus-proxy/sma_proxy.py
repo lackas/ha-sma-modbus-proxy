@@ -31,7 +31,7 @@ logging.getLogger("pymodbus.logging").addFilter(_SkipSetValues())
 logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 
 # Inverter Modbus settings
 INVERTER_UNIT_ID = 126
@@ -71,7 +71,7 @@ def not_impl_s16():
 # ---------------------------------------------------------------------------
 
 
-def build_register_map(serial: int) -> list[int]:
+def build_register_map(serial: int, device_identifier: str = "STP 10.0-3AV-40") -> list[int]:
     regs = [0] * 124
 
     def w(addr, val):
@@ -86,7 +86,7 @@ def build_register_map(serial: int) -> list[int]:
     # Model 1: Common (66 registers)
     w(40003, 1); w(40004, 66)
     w_str(40005, "SMA", 16)
-    w_str(40021, "STP 10.0-3AV-40", 16)
+    w_str(40021, device_identifier, 16)
     w_str(40037, "", 8)
     w_str(40045, "04.00.02.R", 8)
     w_str(40053, str(serial), 16)
@@ -531,55 +531,61 @@ class _TrackingDeviceContext(ModbusDeviceContext):
 # ---------------------------------------------------------------------------
 
 
+def _regs_to_str(regs: list[int]) -> str:
+    """Convert a list of uint16 registers to an ASCII string."""
+    b = bytes(byte for w in regs for byte in [w >> 8, w & 0xFF])
+    return b.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+
+
 def read_inverter_identity(inverter_ip: str) -> tuple[int, int]:
-    """Read serial number and max power from the inverter.
+    """Read serial number and max power from inverter via SunSpec.
 
-    Returns (serial, max_power_w). Retries until successful.
+    Serial: SunSpec Common model, register 40053 (0-based: 40052), 16-reg string.
+    Max power (WRtg): SunSpec Model 120 (Nameplate), found by walking the model
+    chain forward from Model 103.
+
+    Returns (serial, max_power_w). Values are 0 on failure.
     """
-    backoff = 5
-    while True:
-        client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
-        if not client.connect():
-            log.warning("Cannot reach inverter at %s for identity read — retrying in %ds", inverter_ip, backoff)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 300)
-            continue
+    client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
+    if not client.connect():
+        return 0, 0
+    try:
+        # Serial from SunSpec Common model
+        serial = 0
+        r = client.read_holding_registers(40052, count=16, device_id=INVERTER_UNIT_ID)
+        if not r.isError():
+            serial_str = _regs_to_str(r.registers)
+            serial = int(serial_str) if serial_str.isdigit() else 0
 
-        try:
-            # Serial number: SMA register 30005 (U32, 2 regs, 0-based addr = 30004)
-            r_serial = client.read_holding_registers(30004, count=2, device_id=INVERTER_UNIT_ID)
-            if r_serial.isError():
-                log.warning("Failed to read serial: %s — retrying in %ds", r_serial, backoff)
-                client.close()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-                continue
+        # WRtg from Model 120: walk forward from Model 103 header
+        # MODEL_103_ADDR points to Model 103 data (past header), so header is 2 regs before
+        max_power_w = 0
+        hdr_addr = MODEL_103_ADDR - 2
+        r_hdr = client.read_holding_registers(hdr_addr, count=2, device_id=INVERTER_UNIT_ID)
+        if not r_hdr.isError() and r_hdr.registers[0] == 103:
+            addr = hdr_addr + 2 + r_hdr.registers[1]
+            for _ in range(10):
+                r_next = client.read_holding_registers(addr, count=2, device_id=INVERTER_UNIT_ID)
+                if r_next.isError():
+                    break
+                model_id, model_len = r_next.registers[0], r_next.registers[1]
+                if model_id == 0xFFFF:
+                    break
+                if model_id == 120:
+                    r120 = client.read_holding_registers(addr + 2, count=model_len, device_id=INVERTER_UNIT_ID)
+                    if not r120.isError():
+                        wrtg = r120.registers[1]
+                        wrtg_sf = _sf(r120.registers[22])
+                        max_power_w = int(wrtg * 10**wrtg_sf)
+                    break
+                addr += 2 + model_len
 
-            serial = (r_serial.registers[0] << 16) | r_serial.registers[1]
-
-            # Max power: SMA register 30231 (U32, 2 regs, 0-based addr = 30230)
-            r_power = client.read_holding_registers(30230, count=2, device_id=INVERTER_UNIT_ID)
-            if r_power.isError():
-                log.warning("Failed to read max power: %s — retrying in %ds", r_power, backoff)
-                client.close()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-                continue
-
-            max_power_w = (r_power.registers[0] << 16) | r_power.registers[1]
-
-            client.close()
-            log.info("Inverter identity: serial=%d, max_power=%dW", serial, max_power_w)
-            return serial, max_power_w
-
-        except Exception as e:
-            log.warning("Identity read error: %s — retrying in %ds", e, backoff)
-            try:
-                client.close()
-            except Exception:
-                pass
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 300)
+        return serial, max_power_w
+    except Exception as e:
+        log.warning("Identity read error: %s", e)
+        return 0, 0
+    finally:
+        client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -594,22 +600,38 @@ def main():
     parser.add_argument("--options", default=None)
     args = parser.parse_args()
 
+    device_id = os.environ.get("DEVICE_IDENTIFIER", "STP 10.0-3AV-40")
     inverter_ip = os.environ.get("INVERTER_IP", args.inverter_ip)
 
     if args.options and Path(args.options).exists():
         opts = json.loads(Path(args.options).read_text())
         inverter_ip = opts.get("inverter_ip", inverter_ip)
+        device_id = opts.get("device_identifier", device_id)
 
     if not inverter_ip:
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
         return
 
     log.info("SMA Modbus Proxy v%s", VERSION)
+
+    # Auto-detect serial and max power from inverter
     log.info("Reading identity from inverter at %s...", inverter_ip)
     serial, max_power_w = read_inverter_identity(inverter_ip)
-    log.info("Inverter: %s, Serial: %d, Max power: %dW", inverter_ip, serial, max_power_w)
+    if serial:
+        log.info("Auto-detected serial: %d", serial)
+    else:
+        log.warning("Could not read serial from inverter, using default 1234567890")
+        serial = 1234567890
+    if max_power_w:
+        log.info("Auto-detected max power: %dW", max_power_w)
+    else:
+        log.warning("Could not read max power from inverter, using default 12000W")
+        max_power_w = 12000
 
-    regs = build_register_map(serial)
+    log.info("Inverter: %s, Serial: %d, Max power: %dW, Device ID: %s",
+             inverter_ip, serial, max_power_w, device_id)
+
+    regs = build_register_map(serial, device_id)
     block = ModbusSequentialDataBlock(0, [0] * 40001 + regs + [0] * 25000)
     store = _TrackingDeviceContext(hr=block, ir=block)
 
