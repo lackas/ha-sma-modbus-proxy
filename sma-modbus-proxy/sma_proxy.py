@@ -546,8 +546,8 @@ def read_inverter_identity(inverter_ip: str) -> tuple[int, int]:
             continue
 
         try:
-            # Serial number: register 30005 (U32, 2 regs)
-            r_serial = client.read_holding_registers(30005, count=2, device_id=INVERTER_UNIT_ID)
+            # Serial number: SMA register 30005 (U32, 2 regs, 0-based addr = 30004)
+            r_serial = client.read_holding_registers(30004, count=2, device_id=INVERTER_UNIT_ID)
             if r_serial.isError():
                 log.warning("Failed to read serial: %s — retrying in %ds", r_serial, backoff)
                 client.close()
@@ -557,8 +557,8 @@ def read_inverter_identity(inverter_ip: str) -> tuple[int, int]:
 
             serial = (r_serial.registers[0] << 16) | r_serial.registers[1]
 
-            # Max power: register 30231 (U32, 2 regs)
-            r_power = client.read_holding_registers(30231, count=2, device_id=INVERTER_UNIT_ID)
+            # Max power: SMA register 30231 (U32, 2 regs, 0-based addr = 30230)
+            r_power = client.read_holding_registers(30230, count=2, device_id=INVERTER_UNIT_ID)
             if r_power.isError():
                 log.warning("Failed to read max power: %s — retrying in %ds", r_power, backoff)
                 client.close()
