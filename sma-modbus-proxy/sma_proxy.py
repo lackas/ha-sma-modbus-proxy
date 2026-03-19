@@ -31,7 +31,7 @@ logging.getLogger("pymodbus.logging").addFilter(_SkipSetValues())
 logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 
 # Inverter Modbus settings
 INVERTER_UNIT_ID = 126
@@ -527,6 +527,62 @@ class _TrackingDeviceContext(ModbusDeviceContext):
 
 
 # ---------------------------------------------------------------------------
+# Inverter identity (one-time read at startup)
+# ---------------------------------------------------------------------------
+
+
+def read_inverter_identity(inverter_ip: str) -> tuple[int, int]:
+    """Read serial number and max power from the inverter.
+
+    Returns (serial, max_power_w). Retries until successful.
+    """
+    backoff = 5
+    while True:
+        client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
+        if not client.connect():
+            log.warning("Cannot reach inverter at %s for identity read — retrying in %ds", inverter_ip, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+            continue
+
+        try:
+            # Serial number: register 30005 (U32, 2 regs)
+            r_serial = client.read_holding_registers(30005, count=2, device_id=INVERTER_UNIT_ID)
+            if r_serial.isError():
+                log.warning("Failed to read serial: %s — retrying in %ds", r_serial, backoff)
+                client.close()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+                continue
+
+            serial = (r_serial.registers[0] << 16) | r_serial.registers[1]
+
+            # Max power: register 30231 (U32, 2 regs)
+            r_power = client.read_holding_registers(30231, count=2, device_id=INVERTER_UNIT_ID)
+            if r_power.isError():
+                log.warning("Failed to read max power: %s — retrying in %ds", r_power, backoff)
+                client.close()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+                continue
+
+            max_power_w = (r_power.registers[0] << 16) | r_power.registers[1]
+
+            client.close()
+            log.info("Inverter identity: serial=%d, max_power=%dW", serial, max_power_w)
+            return serial, max_power_w
+
+        except Exception as e:
+            log.warning("Identity read error: %s — retrying in %ds", e, backoff)
+            try:
+                client.close()
+            except Exception:
+                pass
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -538,21 +594,19 @@ def main():
     parser.add_argument("--options", default=None)
     args = parser.parse_args()
 
-    serial = int(os.environ.get("SERIAL", "1234567890"))
-    max_power_w = int(os.environ.get("MAX_POWER_W", "12000"))
     inverter_ip = os.environ.get("INVERTER_IP", args.inverter_ip)
 
     if args.options and Path(args.options).exists():
         opts = json.loads(Path(args.options).read_text())
         inverter_ip = opts.get("inverter_ip", inverter_ip)
-        serial = opts.get("serial", serial)
-        max_power_w = opts.get("max_power_w", max_power_w)
 
     if not inverter_ip:
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
         return
 
     log.info("SMA Modbus Proxy v%s", VERSION)
+    log.info("Reading identity from inverter at %s...", inverter_ip)
+    serial, max_power_w = read_inverter_identity(inverter_ip)
     log.info("Inverter: %s, Serial: %d, Max power: %dW", inverter_ip, serial, max_power_w)
 
     regs = build_register_map(serial)

@@ -1,3 +1,8 @@
+## 2.0.4
+- Auto-detect serial number and max power from inverter at startup
+- Remove serial and max_power_w from add-on config (only inverter_ip remains)
+- Retry with exponential backoff if inverter unreachable during identity read
+
 ## 2.0.3
 - Show actual version in log output
 - Add throttle detection (state=5) with duration logging
