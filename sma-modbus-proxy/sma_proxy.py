@@ -30,8 +30,88 @@ logging.getLogger("pymodbus.logging").setLevel(logging.INFO)
 logging.getLogger("pymodbus.logging").addFilter(_SkipSetValues())
 logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
+wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.0.5"
+VERSION = "2.0.6"
+
+# ---------------------------------------------------------------------------
+# External-write logging (Modbus FC6 / FC16 from clients like gridX / Gridbox)
+# ---------------------------------------------------------------------------
+
+# Hints for known SunSpec / SMA control registers. Decoding only — does not
+# forward writes to the real inverter (yet). Lets us see what an EMS tries
+# to write so we know which registers need write-through later.
+KNOWN_WRITE_REGS = {
+    # SunSpec Model 123 (Inverter Immediate Controls) — typical layout
+    40149: "Conn_WinTms (model 123 connect window)",
+    40150: "Conn_RvrtTms",
+    40151: "Conn (connect/disconnect)",
+    40152: "WMaxLimPct (active power limit %, SF=-2)",
+    40153: "WMaxLimPct_WinTms",
+    40154: "WMaxLimPct_RvrtTms",
+    40155: "WMaxLimPct_RmpTms",
+    40156: "WMaxLim_Ena (enable power limit)",
+    40157: "OutPFSet (power factor set)",
+    40162: "VArPct_Mod",
+    40163: "VArPct_Ena (reactive power enable)",
+    # SMA proprietary control registers (common ones for Sunny Tripower family)
+    40015: "SMA Pmax setpoint (W) [hi]",
+    40016: "SMA Pmax setpoint (W) [lo]",
+    40023: "SMA active power limit (W)",
+    40025: "SMA active power limit set source",
+    41121: "SMA cos phi setpoint",
+    41123: "SMA reactive power setpoint",
+}
+
+
+def _decode_write(wire_addr: int, values) -> str:
+    """Best-effort interpretation of an external write."""
+    hint = KNOWN_WRITE_REGS.get(wire_addr, "unknown register")
+    vals = list(values) if isinstance(values, (list, tuple)) else [values]
+    hex_vals = " ".join(f"{v:04x}" for v in vals)
+    dec_vals = " ".join(str(v) for v in vals)
+    extra = ""
+    if len(vals) == 1:
+        v = vals[0]
+        sv = v - 0x10000 if v >= 0x8000 else v
+        extra = f"  u16={v}  s16={sv}"
+    elif len(vals) == 2:
+        u32 = (vals[0] << 16) | vals[1]
+        s32 = u32 - 0x100000000 if u32 >= 0x80000000 else u32
+        extra = f"  u32={u32}  s32={s32}"
+    return f"reg={wire_addr} ({hint}) words=[{hex_vals}] dec=[{dec_vals}]{extra}"
+
+
+class LoggingDataBlock(ModbusSequentialDataBlock):
+    """Modbus data block that logs writes from external clients.
+
+    Internal store updates (driven by poll_inverter and static identity setup)
+    flip ``_silent`` to True so they don't drown the log. Any setValues() call
+    while ``_silent`` is False is treated as client-originated and logged.
+    """
+
+    _silent = False
+
+    @classmethod
+    def silent(cls, value: bool = True):
+        cls._silent = value
+
+    def setValues(self, address, values):
+        if not LoggingDataBlock._silent:
+            wire_a = address          # if address is already wire address
+            wire_b = address + 1      # if address is 0-based offset
+            try:
+                wlog.warning(
+                    "EXTERNAL WRITE addr=%d (alt=%d) count=%d  |  %s  |  alt: %s",
+                    wire_a, wire_b,
+                    len(values) if isinstance(values, (list, tuple)) else 1,
+                    _decode_write(wire_a, values),
+                    _decode_write(wire_b, values),
+                )
+            except Exception as e:
+                wlog.warning("EXTERNAL WRITE addr=%d values=%r  (decode failed: %s)",
+                             address, values, e)
+        return super().setValues(address, values)
 
 # Inverter Modbus settings
 INVERTER_UNIT_ID = 126
@@ -185,6 +265,15 @@ def poll_inverter(client: ModbusTcpClient, store: ModbusDeviceContext,
 
     Returns the SunSpec operating state on success (>= 0), or -1 on error.
     """
+    LoggingDataBlock.silent(True)
+    try:
+        return _poll_inverter_impl(client, store, poll_count)
+    finally:
+        LoggingDataBlock.silent(False)
+
+
+def _poll_inverter_impl(client: ModbusTcpClient, store: ModbusDeviceContext,
+                        poll_count: list[int]):
     # --- Read Model 103 (50 data registers) ---
     r103 = client.read_holding_registers(MODEL_103_ADDR, count=50, device_id=INVERTER_UNIT_ID)
     if r103.isError():
@@ -632,19 +721,23 @@ def main():
              inverter_ip, serial, max_power_w, device_id)
 
     regs = build_register_map(serial, device_id)
-    block = ModbusSequentialDataBlock(0, [0] * 40001 + regs + [0] * 25000)
+    block = LoggingDataBlock(0, [0] * 40001 + regs + [0] * 25000)
     store = _TrackingDeviceContext(hr=block, ir=block)
 
-    # Static SMA identification registers
-    store.setValues(3, 30003, [0, 378])
-    store.setValues(3, 30005, [(serial >> 16) & 0xFFFF, serial & 0xFFFF])
-    store.setValues(3, 30051, [0, 8001])
-    store.setValues(3, 30053, [0, 9348])
-    store.setValues(3, 30057, [(serial >> 16) & 0xFFFF, serial & 0xFFFF])
-    store.setValues(3, 30059, [0x0400, 0x0002])
-    store.setValues(3, 30201, [0, 307])
-    store.setValues(3, 30231, _u32_words(max_power_w))
-    store.setValues(3, 30233, _u32_words(max_power_w))
+    # Static SMA identification registers (silent: not from external client)
+    LoggingDataBlock.silent(True)
+    try:
+        store.setValues(3, 30003, [0, 378])
+        store.setValues(3, 30005, [(serial >> 16) & 0xFFFF, serial & 0xFFFF])
+        store.setValues(3, 30051, [0, 8001])
+        store.setValues(3, 30053, [0, 9348])
+        store.setValues(3, 30057, [(serial >> 16) & 0xFFFF, serial & 0xFFFF])
+        store.setValues(3, 30059, [0x0400, 0x0002])
+        store.setValues(3, 30201, [0, 307])
+        store.setValues(3, 30231, _u32_words(max_power_w))
+        store.setValues(3, 30233, _u32_words(max_power_w))
+    finally:
+        LoggingDataBlock.silent(False)
 
     context = ModbusServerContext(
         devices={0: store, 1: store, 2: store, 3: store, 247: store},

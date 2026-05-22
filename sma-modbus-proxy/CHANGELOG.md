@@ -1,3 +1,9 @@
+## 2.0.6
+- Log incoming external Modbus writes (FC6 / FC16) from clients like gridX / Gridbox
+- New `sma_proxy.writes` logger at WARNING level — decodes register, hex/dec values, u16/s16/u32/s32 interpretation, and hints for known SunSpec Model 123 + SMA proprietary control registers
+- Internal store updates (poll_inverter, identity setup) stay silent so external writes are clearly visible
+- Logging-only: writes are NOT yet forwarded to the real inverter (planned for a future version)
+
 ## 2.0.5
 - Auto-detect serial number from inverter (SunSpec Common model)
 - Auto-detect max power from inverter (SunSpec Model 120 WRtg)
