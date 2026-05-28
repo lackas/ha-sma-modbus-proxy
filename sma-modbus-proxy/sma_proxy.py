@@ -32,7 +32,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # ---------------------------------------------------------------------------
 # External-write handling: log + translate + forward (Modbus FC6 / FC16 from
@@ -205,6 +205,95 @@ def discover_sunspec_models(inverter_ip: str, unit_id: int = 126,
         client.close()
 
 
+class _CurtailmentTracker:
+    """Track curtailment state for clean INFO-level logging.
+
+    Detects state transitions (free ↔ curtailed) and emits a one-line INFO
+    event on each change. A 60-second heartbeat dumps the current state +
+    setpoint range so the log shows "things are working" without spam.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = "unknown"          # "free" | "curtailed" | "unknown"
+        self._last_pct: float | None = None
+        self._writes_in_interval = 0
+        self._pct_min: float | None = None
+        self._pct_max: float | None = None
+        self._last_write_ts: float = 0.0
+
+    def record(self, pct_raw: int, ena: int) -> None:
+        """Record one translate event and emit state-change INFO if needed."""
+        pct = pct_raw / 100.0
+        new_state = "free" if ena == 0 else "curtailed"
+
+        with self._lock:
+            self._writes_in_interval += 1
+            self._last_write_ts = time.time()
+            self._last_pct = pct
+            if self._pct_min is None or pct < self._pct_min:
+                self._pct_min = pct
+            if self._pct_max is None or pct > self._pct_max:
+                self._pct_max = pct
+            old_state = self._state
+            self._state = new_state
+
+        if old_state != new_state and old_state != "unknown":
+            if new_state == "curtailed":
+                log.info("→ Curtailment STARTED — setpoint dropped to %.2f %% (Ena=1)", pct)
+            else:
+                log.info("→ Curtailment RELEASED — setpoint back to %.2f %%, Ena=0", pct)
+        elif old_state == "unknown":
+            # first-ever write — log once so user sees it works
+            label = "curtailment active" if new_state == "curtailed" else "free running"
+            log.info("First translate received — STP X is %s (setpoint %.2f %%)", label, pct)
+
+    def emit_heartbeat(self) -> None:
+        """Called every 60 s — log one INFO summary, then reset counters."""
+        with self._lock:
+            count = self._writes_in_interval
+            pct_min = self._pct_min
+            pct_max = self._pct_max
+            state = self._state
+            last = self._last_pct
+            last_ts = self._last_write_ts
+            # reset for next interval
+            self._writes_in_interval = 0
+            self._pct_min = None
+            self._pct_max = None
+
+        if count == 0 and state == "unknown":
+            log.info("Heartbeat: idle — no EMS writes yet (waiting for gridX client)")
+            return
+        if count == 0:
+            stale = int(time.time() - last_ts) if last_ts else 0
+            log.info("Heartbeat: no writes in last 60s (last: %d s ago, state=%s)",
+                     stale, state)
+            return
+
+        if state == "free":
+            log.info("Heartbeat: STP X free running — %d writes, setpoint = 100 %%", count)
+        elif pct_min == pct_max:
+            log.info("Heartbeat: curtailment active — %d writes, setpoint = %.2f %% (steady)",
+                     count, pct_min)
+        else:
+            log.info("Heartbeat: curtailment active — %d writes, setpoint %.2f–%.2f %% (now %.2f %%)",
+                     count, pct_min, pct_max, last)
+
+
+_curtailment_tracker = _CurtailmentTracker()
+
+
+def _heartbeat_loop():
+    """Background thread: emit curtailment heartbeat every 60 s."""
+    while True:
+        time.sleep(60)
+        try:
+            _curtailment_tracker.emit_heartbeat()
+        except Exception as e:
+            log.warning("Heartbeat error: %s", e)
+
+
 def _translate_legacy_to_m123(client, m123_data_wire: int, unit_id: int,
                               wire_addr: int, vals: list[int]) -> bool:
     """Translate a legacy SMA write to a SunSpec Model 123 write.
@@ -222,8 +311,8 @@ def _translate_legacy_to_m123(client, m123_data_wire: int, unit_id: int,
         pct_raw = vals[0]
         pct = pct_raw / 100.0
         ena = 0 if pct_raw >= 10000 else 1  # disable limit at 100 %
-        wlog.warning("TRANSLATE  WMaxLimPct = %.2f %% (raw=%d), Ena = %d → Model 123",
-                     pct, pct_raw, ena)
+        wlog.debug("TRANSLATE  WMaxLimPct = %.2f %% (raw=%d), Ena = %d → Model 123",
+                   pct, pct_raw, ena)
 
         pdu_pct = (m123_data_wire - 1) + M123_OFFSET["WMaxLimPct"]
         pdu_ena = (m123_data_wire - 1) + M123_OFFSET["WMaxLim_Ena"]
@@ -238,18 +327,21 @@ def _translate_legacy_to_m123(client, m123_data_wire: int, unit_id: int,
                 wlog.warning("  ✗ write WMaxLimPct (wire %d) failed: %s",
                              m123_data_wire + M123_OFFSET["WMaxLimPct"], rr)
             else:
-                wlog.info("  ✓ wire %d = %d (M123 WMaxLimPct)",
-                          m123_data_wire + M123_OFFSET["WMaxLimPct"], pct_raw)
+                wlog.debug("  ✓ wire %d = %d (M123 WMaxLimPct)",
+                           m123_data_wire + M123_OFFSET["WMaxLimPct"], pct_raw)
 
             rr2 = client.write_register(pdu_ena, ena, device_id=unit_id)
             if rr2.isError():
                 wlog.warning("  ✗ write WMaxLim_Ena (wire %d) failed: %s",
                              m123_data_wire + M123_OFFSET["WMaxLim_Ena"], rr2)
             else:
-                wlog.info("  ✓ wire %d = %d (M123 WMaxLim_Ena)",
-                          m123_data_wire + M123_OFFSET["WMaxLim_Ena"], ena)
+                wlog.debug("  ✓ wire %d = %d (M123 WMaxLim_Ena)",
+                           m123_data_wire + M123_OFFSET["WMaxLim_Ena"], ena)
         except Exception as e:
             wlog.warning("  ✗ translate exception: %s", e)
+
+        # Track state for INFO heartbeat / state-change events
+        _curtailment_tracker.record(pct_raw, ena)
         return True
 
     if wire_addr == 40211 and len(vals) == 2:
@@ -304,11 +396,12 @@ class LoggingDataBlock(ModbusSequentialDataBlock):
                         alt_label = f" (matched @ addr+1={address + 1})"
 
                 if nice is not None:
-                    wlog.warning("WRITE  %s%s  [addr=%d, count=%d]",
-                                 nice, alt_label, address, len(vals))
+                    wlog.debug("WRITE  %s%s  [addr=%d, count=%d]",
+                               nice, alt_label, address, len(vals))
                 else:
                     raw_a = _format_raw_write(address, vals)
                     raw_b = _format_raw_write(address + 1, vals)
+                    # Unknown writes stay at WARNING — they need attention
                     wlog.warning("WRITE  UNKNOWN  %s  |  alt: %s",
                                  raw_a, raw_b)
 
@@ -1000,6 +1093,9 @@ def main():
     threading.Thread(
         target=inverter_poll_loop, args=(inverter_ip, store), daemon=True
     ).start()
+
+    # Start curtailment heartbeat thread (one INFO summary line per minute)
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
     # Start Modbus activity reporter
     def modbus_reporter():

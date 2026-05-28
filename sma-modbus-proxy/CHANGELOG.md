@@ -1,3 +1,13 @@
+## 2.2.1
+- Restructured log levels so INFO shows "things are working" without spam:
+  - **INFO**: state-change events (Curtailment STARTED / RELEASED), plus a
+    60-second heartbeat summary (write count + setpoint range/state)
+  - **DEBUG**: every individual write, translate, and per-register success
+  - **WARNING**: only real problems (forward failures, exceptions,
+    inverter connection loss, unknown register writes)
+- Drops log volume from ~90 lines/min to ~1-2 INFO lines/min during normal
+  operation; full firehose available via `log_level: debug`.
+
 ## 2.2.0
 - **SunSpec model discovery on startup** — walks the inverter's model chain
   and identifies all exposed models. Logs each one with its base wire address.
