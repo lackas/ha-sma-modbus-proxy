@@ -1,3 +1,17 @@
+## 2.1.0
+- Human-friendly decode for known control registers:
+  - `40024` (PFCtlComCfg.PF) → cos φ setpoint (FIX4, 10000 = 1.0)
+  - `40212` (WCtlComCfg.WMod) → active power control mode (U32 enum, 1079 = "plant control")
+  - `43092` → vendor-specific (raw u32 fallback)
+- Unknown registers fall back to raw u16/s16/u32/s32 dump (unchanged behavior)
+- New `forward_writes` config flag (default `true`).
+  External writes are forwarded 1:1 to the real inverter via a dedicated
+  Modbus client. This is the safer default: without forwarding the STP X
+  runs at default cos φ=1 and ignores gridX's grid-code Q(P) commands.
+  Inverter must be configured for "Externe Vorgabe durch Kommunikation"
+  in its WebUI — otherwise writes are rejected but logged.
+  Set `forward_writes: false` to disable (legacy 2.0.6 behavior, logging only).
+
 ## 2.0.6
 - Log incoming external Modbus writes (FC6 / FC16) from clients like gridX / Gridbox
 - New `sma_proxy.writes` logger at WARNING level — decodes register, hex/dec values, u16/s16/u32/s32 interpretation, and hints for known SunSpec Model 123 + SMA proprietary control registers
