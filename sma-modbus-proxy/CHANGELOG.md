@@ -1,3 +1,9 @@
+## 2.2.2
+- Heartbeat only emits while curtailment is active; free-running stays silent.
+  (State-change events + 5-min Modbus stats already cover liveness.)
+- 5-min Modbus stats now report writes alongside reads.
+- Compacted INFO message wording.
+
 ## 2.2.1
 - Restructured log levels so INFO shows "things are working" without spam:
   - **INFO**: state-change events (Curtailment STARTED / RELEASED), plus a

@@ -32,7 +32,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 # ---------------------------------------------------------------------------
 # External-write handling: log + translate + forward (Modbus FC6 / FC16 from
@@ -240,44 +240,39 @@ class _CurtailmentTracker:
 
         if old_state != new_state and old_state != "unknown":
             if new_state == "curtailed":
-                log.info("→ Curtailment STARTED — setpoint dropped to %.2f %% (Ena=1)", pct)
+                log.info("Curtailment STARTED — setpoint %.2f %%", pct)
             else:
-                log.info("→ Curtailment RELEASED — setpoint back to %.2f %%, Ena=0", pct)
+                log.info("Curtailment RELEASED — setpoint %.2f %%", pct)
         elif old_state == "unknown":
-            # first-ever write — log once so user sees it works
-            label = "curtailment active" if new_state == "curtailed" else "free running"
-            log.info("First translate received — STP X is %s (setpoint %.2f %%)", label, pct)
+            label = "curtailed" if new_state == "curtailed" else "free"
+            log.info("First translate: STP X %s (setpoint %.2f %%)", label, pct)
 
     def emit_heartbeat(self) -> None:
-        """Called every 60 s — log one INFO summary, then reset counters."""
+        """Called every 60 s — log INFO summary only while curtailment is active.
+
+        Free / unknown states stay silent: state-change events (STARTED /
+        RELEASED) cover transitions, and the existing 5-min Modbus read
+        stats prove the proxy is alive.
+        """
         with self._lock:
             count = self._writes_in_interval
             pct_min = self._pct_min
             pct_max = self._pct_max
             state = self._state
             last = self._last_pct
-            last_ts = self._last_write_ts
             # reset for next interval
             self._writes_in_interval = 0
             self._pct_min = None
             self._pct_max = None
 
-        if count == 0 and state == "unknown":
-            log.info("Heartbeat: idle — no EMS writes yet (waiting for gridX client)")
-            return
-        if count == 0:
-            stale = int(time.time() - last_ts) if last_ts else 0
-            log.info("Heartbeat: no writes in last 60s (last: %d s ago, state=%s)",
-                     stale, state)
+        if state != "curtailed":
             return
 
-        if state == "free":
-            log.info("Heartbeat: STP X free running — %d writes, setpoint = 100 %%", count)
-        elif pct_min == pct_max:
-            log.info("Heartbeat: curtailment active — %d writes, setpoint = %.2f %% (steady)",
+        if pct_min == pct_max:
+            log.info("Curtailment: %d writes, setpoint %.2f %% (steady)",
                      count, pct_min)
         else:
-            log.info("Heartbeat: curtailment active — %d writes, setpoint %.2f–%.2f %% (now %.2f %%)",
+            log.info("Curtailment: %d writes, %.2f–%.2f %% (now %.2f %%)",
                      count, pct_min, pct_max, last)
 
 
@@ -317,6 +312,12 @@ def _translate_legacy_to_m123(client, m123_data_wire: int, unit_id: int,
         pdu_pct = (m123_data_wire - 1) + M123_OFFSET["WMaxLimPct"]
         pdu_ena = (m123_data_wire - 1) + M123_OFFSET["WMaxLim_Ena"]
 
+        # We always write both. SMA's design assumes cyclic writes; skipping the
+        # Ena on the assumption it's already correct breaks the self-healing
+        # property — if the inverter is power-cycled or resets, its Ena returns
+        # to default, and we'd never re-assert it. The 1 Hz cycle cost is well
+        # under SMA's documented "cyclically OK" budget for grid-management
+        # registers.
         try:
             if not client.connected:
                 if not client.connect():
@@ -384,6 +385,7 @@ class LoggingDataBlock(ModbusSequentialDataBlock):
 
     def setValues(self, address, values):
         if not LoggingDataBlock._silent:
+            _modbus_tracker.on_write()
             try:
                 vals = list(values) if isinstance(values, (list, tuple)) else [values]
                 # pymodbus ModbusDeviceContext has already added +1 — so ``address``
@@ -873,12 +875,14 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
 
 
 class _ModbusTracker:
-    """Tracks Modbus client connections and read activity."""
+    """Tracks Modbus client connections, reads, and external writes."""
 
     def __init__(self):
         self._clients_seen: set[str] = set()
         self._read_count = 0
-        self._last_report_count = 0
+        self._write_count = 0
+        self._last_read_report = 0
+        self._last_write_report = 0
 
     def on_connect(self, connected: bool) -> None:
         """Called by pymodbus trace_connect (True=connect, False=disconnect)."""
@@ -890,15 +894,21 @@ class _ModbusTracker:
     def on_read(self):
         self._read_count += 1
 
+    def on_write(self):
+        self._write_count += 1
+
     def report(self):
         """Called periodically to report activity."""
-        count = self._read_count
-        delta = count - self._last_report_count
-        self._last_report_count = count
-        if count == 0:
-            log.info("Modbus: no reads received yet — waiting for client")
+        rc = self._read_count
+        wc = self._write_count
+        rd = rc - self._last_read_report
+        wd = wc - self._last_write_report
+        self._last_read_report = rc
+        self._last_write_report = wc
+        if rc == 0 and wc == 0:
+            log.info("Modbus: idle — no client traffic")
         else:
-            log.info("Modbus: %d reads total (%d since last report)", count, delta)
+            log.info("Modbus: %d reads / %d writes (+%d / +%d)", rc, wc, rd, wd)
 
 
 _modbus_tracker = _ModbusTracker()
