@@ -1,3 +1,23 @@
+## 2.2.0
+- **SunSpec model discovery on startup** — walks the inverter's model chain
+  and identifies all exposed models. Logs each one with its base wire address.
+  Required for the translation layer; works on STP X 12-50 (ennexOS) where
+  SunSpec Model 123 lives at firmware-dependent addresses.
+- **Translation layer for gridX legacy writes**: incoming writes on legacy
+  SMA addresses are mapped to SunSpec Model 123 writes on the real inverter.
+  - `wire 40024` (legacy WMaxLimPct, 0.01 %-units) → Model 123 WMaxLimPct +
+    WMaxLim_Ena (auto-enabled when limit < 100 %)
+  - `wire 40212` (WMod enum) → ignored (Model 123 has its own Ena)
+  - `wire 43091` (Grid Guard) → ignored (SunSpec needs no auth)
+  Confirmed working via live test on STP X 12-50 firmware 03.14.22.R.
+- New `log_level` config option (`debug` / `info` / `warning`, default `info`).
+  `info` keeps startup, writes, and errors visible; `debug` adds per-minute
+  AC/DC summaries and poll-interval changes.
+- `forward_writes` default changed back to `false` — the user enables it
+  after verifying discovery output on first deploy.
+- Several chatty INFO log lines moved to DEBUG (per-minute AC/DC summary,
+  first-Modbus-read, poll-interval changes).
+
 ## 2.1.0
 - Human-friendly decode for known control registers:
   - `40024` (PFCtlComCfg.PF) → cos φ setpoint (FIX4, 10000 = 1.0)

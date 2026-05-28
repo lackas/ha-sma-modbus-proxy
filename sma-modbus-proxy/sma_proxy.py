@@ -32,20 +32,24 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ---------------------------------------------------------------------------
-# External-write logging + optional forwarding (Modbus FC6 / FC16 from clients
-# like gridX / Gridbox)
+# External-write handling: log + translate + forward (Modbus FC6 / FC16 from
+# clients like gridX / Gridbox)
 # ---------------------------------------------------------------------------
 #
-# Known SMA / SunSpec control registers observed in gridX → Proxy traffic.
-# When ``forward_writes`` is enabled, writes are passed 1:1 to the real
-# inverter — this allows the STP X to receive grid-code reactive power
-# (Q(P) cos φ) commands and the WMod enable, so the STP behaves like a
-# direct gridX-controlled inverter instead of running at default cos φ=1.
+# gridX speaks the *legacy* SMA Modbus profile (40024 WMaxLimPct%, 40212 WMod
+# enum, 43091 Grid Guard). The STP X 12-50 with ennexOS firmware does NOT
+# expose those addresses — instead it offers SunSpec Model 123 (Immediate
+# Controls) for active power limit / cos φ.
+#
+# This proxy translates incoming legacy writes into the equivalent SunSpec
+# Model 123 writes on the real inverter. Discovered on startup; the actual
+# wire addresses depend on the inverter firmware's model chain layout.
 
-# SMA TAGLIST values for WMod (WModCfg.WCtlComCfg.WMod, U32 enum)
+# SMA TAGLIST values for WMod (legacy enum register; we log these but do not
+# need to forward — Model 123 has its own Ena bit).
 WMOD_ENUM = {
     303: "Off",
     1077: "Active power limit P in W",
@@ -54,28 +58,64 @@ WMOD_ENUM = {
     1080: "Active power setpoint",
 }
 
-# Register metadata for human-friendly decode.
-# Keys are *1-based wire addresses* (as logged by setValues after pymodbus' +1).
+# Legacy SMA register metadata for human-friendly decode. These addresses are
+# what gridX writes — they do NOT exist on the STP X (ennexOS); we translate
+# them to Model 123 instead.
 KNOWN_WRITE_REGS = {
     40024: {
-        "name": "PFCtlComCfg.PF",
-        "desc": "cos φ setpoint (Verschiebungsfaktor durch Anlagensteuerung)",
-        "kind": "u16_fix4",  # value / 10000 = cos φ
+        "name": "Legacy WMaxLimPct",
+        "desc": "Active power limit % (0.01 %-units), legacy SMA profile",
+        "kind": "u16_pct_sf2",  # value / 100 = percent
         "expect_count": 1,
     },
     40212: {
-        "name": "WCtlComCfg.WMod",
-        "desc": "Active power control mode",
+        "name": "Legacy WMod",
+        "desc": "Active power control mode (legacy SMA enum)",
         "kind": "u32_enum",
         "enums": WMOD_ENUM,
         "expect_count": 2,
     },
     43092: {
-        "name": "vendor_43092",
-        "desc": "Vendor-specific (suspected gridX session/timestamp)",
+        "name": "Legacy Grid Guard",
+        "desc": "SMA Grid Guard code (legacy auth, not needed for SunSpec)",
         "kind": "u32_raw",
         "expect_count": 2,
     },
+}
+
+# Known SunSpec model IDs (for discovery logging)
+SUNSPEC_MODEL_NAMES = {
+    1: "Common",
+    103: "Three Phase Inverter (int)",
+    120: "Nameplate",
+    121: "Basic Settings",
+    122: "Measurements/Status",
+    123: "Immediate Controls",
+    160: "Multiple MPPT",
+    701: "DER AC Measurement",
+    702: "DER Capacity",
+    703: "DER Enter Service",
+    704: "DER AC Controls",
+    705: "DER Volt-Var",
+    706: "DER Volt-Watt",
+    707: "DER Trip LV",
+    708: "DER Trip HV",
+    709: "DER Trip LF",
+    710: "DER Trip HF",
+    711: "DER Frequency Droop",
+    712: "DER Watt-Var",
+    714: "DER DC Measurement",
+}
+
+# SunSpec Model 123 offset table (relative to data base wire address)
+M123_OFFSET = {
+    "Conn":            2,   # u16 enum 0=Disconn, 1=Conn
+    "WMaxLimPct":      3,   # u16, %WMax, scale by WMaxLimPct_SF (typically -2)
+    "WMaxLim_Ena":     7,   # u16 enum 0=Off, 1=On
+    "OutPFSet":        8,   # s16, cos φ
+    "OutPFSet_Ena":   12,
+    "WMaxLimPct_SF":  21,   # sunssf
+    "OutPFSet_SF":    22,
 }
 
 
@@ -120,36 +160,142 @@ def _format_raw_write(wire_addr: int, values: list[int]) -> str:
     return f"addr={wire_addr} words=[{hex_vals}] dec=[{dec_vals}]{extra}"
 
 
+def discover_sunspec_models(inverter_ip: str, unit_id: int = 126,
+                            port: int = 502) -> dict[int, int]:
+    """Walk the SunSpec model chain on the inverter.
+
+    Returns {model_id: data_wire_address}. Empty dict on failure.
+    The data_wire_address points to the first data register of the model
+    (after the 2-register header).
+    """
+    log.info("Discovery: connecting to inverter %s for SunSpec walk", inverter_ip)
+    client = ModbusTcpClient(inverter_ip, port=port, timeout=5)
+    if not client.connect():
+        log.error("Discovery: cannot connect to %s — translation will be disabled", inverter_ip)
+        return {}
+    try:
+        rr = client.read_holding_registers(40000, count=2, device_id=unit_id)
+        if rr.isError() or rr.registers != [0x5375, 0x6E53]:
+            log.error("Discovery: no SunS marker at wire 40001 — got %r", rr)
+            return {}
+        log.info("Discovery: SunS marker found ✓")
+
+        models = {}
+        addr = 40002  # PDU for first model header (wire 40003)
+        for _ in range(50):  # safety cap
+            hdr = client.read_holding_registers(addr, count=2, device_id=unit_id)
+            if hdr.isError():
+                log.warning("Discovery: read failed at PDU %d — stopping walk", addr)
+                break
+            model_id, model_len = hdr.registers[0], hdr.registers[1]
+            if model_id == 0xFFFF:
+                log.info("Discovery: end-of-chain marker at PDU %d (wire %d)",
+                         addr, addr + 1)
+                break
+            data_wire = addr + 1 + 2  # header wire + 2 = first data wire
+            models[model_id] = data_wire
+            name = SUNSPEC_MODEL_NAMES.get(model_id, "<unknown>")
+            log.info("Discovery: Model %3d (%-30s) data @ wire %d, len=%d",
+                     model_id, name, data_wire, model_len)
+            addr += 2 + model_len
+
+        log.info("Discovery: %d SunSpec models total", len(models))
+        return models
+    finally:
+        client.close()
+
+
+def _translate_legacy_to_m123(client, m123_data_wire: int, unit_id: int,
+                              wire_addr: int, vals: list[int]) -> bool:
+    """Translate a legacy SMA write to a SunSpec Model 123 write.
+
+    Returns True if the write was recognized and handled (whether forward
+    succeeded or not — caller should not also do a raw forward).
+    Returns False if no translation rule applies; caller can decide what to do.
+    """
+    if m123_data_wire is None:
+        return False
+
+    if wire_addr == 40024 and len(vals) == 1:
+        # gridX writes WMaxLimPct in 0.01 %-units (5808 → 58.08 %)
+        # Model 123 WMaxLimPct uses the same 0.01 %-scale (SF=-2) — no conversion
+        pct_raw = vals[0]
+        pct = pct_raw / 100.0
+        ena = 0 if pct_raw >= 10000 else 1  # disable limit at 100 %
+        wlog.warning("TRANSLATE  WMaxLimPct = %.2f %% (raw=%d), Ena = %d → Model 123",
+                     pct, pct_raw, ena)
+
+        pdu_pct = (m123_data_wire - 1) + M123_OFFSET["WMaxLimPct"]
+        pdu_ena = (m123_data_wire - 1) + M123_OFFSET["WMaxLim_Ena"]
+
+        try:
+            if not client.connected:
+                if not client.connect():
+                    wlog.warning("  ✗ inverter connection lost — translation skipped")
+                    return True
+            rr = client.write_register(pdu_pct, pct_raw, device_id=unit_id)
+            if rr.isError():
+                wlog.warning("  ✗ write WMaxLimPct (wire %d) failed: %s",
+                             m123_data_wire + M123_OFFSET["WMaxLimPct"], rr)
+            else:
+                wlog.info("  ✓ wire %d = %d (M123 WMaxLimPct)",
+                          m123_data_wire + M123_OFFSET["WMaxLimPct"], pct_raw)
+
+            rr2 = client.write_register(pdu_ena, ena, device_id=unit_id)
+            if rr2.isError():
+                wlog.warning("  ✗ write WMaxLim_Ena (wire %d) failed: %s",
+                             m123_data_wire + M123_OFFSET["WMaxLim_Ena"], rr2)
+            else:
+                wlog.info("  ✓ wire %d = %d (M123 WMaxLim_Ena)",
+                          m123_data_wire + M123_OFFSET["WMaxLim_Ena"], ena)
+        except Exception as e:
+            wlog.warning("  ✗ translate exception: %s", e)
+        return True
+
+    if wire_addr == 40211 and len(vals) == 2:
+        u32 = (vals[0] << 16) | vals[1]
+        wlog.debug("TRANSLATE skip: WMod=%d (Model 123 has own Ena bit)", u32)
+        return True
+
+    if wire_addr == 43091:
+        wlog.debug("TRANSLATE skip: Grid Guard (SunSpec needs no auth)")
+        return True
+
+    return False
+
+
 class LoggingDataBlock(ModbusSequentialDataBlock):
     """Modbus data block that logs writes from external clients.
 
     Internal store updates (driven by poll_inverter and static identity setup)
     flip ``_silent`` to True so they don't drown the log. Any setValues() call
     while ``_silent`` is False is treated as client-originated and logged —
-    and, if forwarding is enabled, passed through to the real inverter.
+    and, if translation is configured, mapped to SunSpec Model 123 writes
+    on the real inverter.
     """
 
     _silent = False
     _forward_client = None       # type: ModbusTcpClient | None
     _forward_unit_id = 126
+    _m123_data_wire: int | None = None  # base wire address of Model 123 data
 
     @classmethod
     def silent(cls, value: bool = True):
         cls._silent = value
 
     @classmethod
-    def enable_forwarding(cls, client, unit_id: int = 126):
+    def enable_forwarding(cls, client, unit_id: int = 126,
+                          m123_data_wire: int | None = None):
         cls._forward_client = client
         cls._forward_unit_id = unit_id
+        cls._m123_data_wire = m123_data_wire
 
     def setValues(self, address, values):
         if not LoggingDataBlock._silent:
             try:
                 vals = list(values) if isinstance(values, (list, tuple)) else [values]
                 # pymodbus ModbusDeviceContext has already added +1 — so ``address``
-                # is the 1-based wire register. Try the direct mapping first; fall
-                # back to the +1 alt interpretation (for safety against pymodbus
-                # version drift).
+                # is the 1-based wire register.
                 nice = _format_known_write(address, vals)
                 alt_label = ""
                 if nice is None:
@@ -167,40 +313,16 @@ class LoggingDataBlock(ModbusSequentialDataBlock):
                                  raw_a, raw_b)
 
                 if LoggingDataBlock._forward_client is not None:
-                    self._forward_write(address, vals)
+                    _translate_legacy_to_m123(
+                        LoggingDataBlock._forward_client,
+                        LoggingDataBlock._m123_data_wire,
+                        LoggingDataBlock._forward_unit_id,
+                        address, vals,
+                    )
             except Exception as e:
                 wlog.warning("WRITE logging/forward error addr=%d values=%r: %s",
                              address, values, e)
         return super().setValues(address, values)
-
-    @staticmethod
-    def _forward_write(wire_addr: int, vals: list[int]) -> None:
-        """Forward an external write to the real inverter.
-
-        ``wire_addr`` is the 1-based register address as seen in the log. The
-        pymodbus client uses 0-based PDU addressing, so we send ``wire_addr - 1``.
-        """
-        client = LoggingDataBlock._forward_client
-        unit_id = LoggingDataBlock._forward_unit_id
-        if client is None:
-            return
-        pdu_addr = wire_addr - 1
-        try:
-            if not client.connected:
-                if not client.connect():
-                    wlog.warning("  → FORWARD skip: inverter connection lost")
-                    return
-            if len(vals) == 1:
-                rr = client.write_register(pdu_addr, vals[0], device_id=unit_id)
-            else:
-                rr = client.write_registers(pdu_addr, vals, device_id=unit_id)
-            if rr.isError():
-                wlog.warning("  → FORWARD FAILED: %s", rr)
-            else:
-                wlog.info("  → forwarded to inverter (wire_addr=%d, pdu=%d)",
-                          wire_addr, pdu_addr)
-        except Exception as e:
-            wlog.warning("  → FORWARD EXCEPTION: %s", e)
 
 # Inverter Modbus settings
 INVERTER_UNIT_ID = 126
@@ -562,15 +684,15 @@ def _poll_inverter_impl(client: ModbusTcpClient, store: ModbusDeviceContext,
         w_s32(base_addr + 2, mppt[idx]["v"] * 100)
         w_s32(base_addr + 4, mppt[idx]["i"] * 1000)
 
-    # --- Periodic logging ---
+    # --- Periodic logging (DEBUG: per-minute AC/DC summaries) ---
     poll_count[0] += 1
-    if poll_count[0] % 60 == 1:  # Every 60 polls (~1 min)
-        log.info(
+    if poll_count[0] % 60 == 1:
+        log.debug(
             "AC: P=%dW VA=%dVA PF=%.2f V=%.0f/%.0f/%.0fV I=%.1f/%.1f/%.1fA Hz=%.2f",
             int(power), int(va), pf_raw, v_l1, v_l2, v_l3, i_l1, i_l2, i_l3, freq,
         )
         dc_w_total = sum(m["w"] for m in mppt)
-        log.info(
+        log.debug(
             "DC: A=%.0fW(%.1fA/%.0fV) B=%.0fW(%.1fA/%.0fV) C=%.0fW(%.1fA/%.0fV) Tot=%dW Yield=%dWh St=%d(%d)",
             mppt[0]["w"], mppt[0]["i"], mppt[0]["v"],
             mppt[1]["w"], mppt[1]["i"], mppt[1]["v"],
@@ -646,7 +768,7 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
             interval = POLL_STANDBY
 
         if interval != prev_interval:
-            log.info("Poll interval: %ds (state=%d)", interval, state)
+            log.debug("Poll interval: %ds (state=%d)", interval, state)
             prev_interval = interval
 
         time.sleep(interval)
@@ -700,7 +822,7 @@ class _TrackingDeviceContext(ModbusDeviceContext):
         _modbus_tracker.on_read()
         if not self._first_read_logged:
             self._first_read_logged = True
-            log.info("First Modbus read (addr=%d, count=%d) — client polling", address, count)
+            log.debug("First Modbus read (addr=%d, count=%d) — client polling", address, count)
         return super().getValues(fc_as_hex, address, count)
 
 
@@ -780,19 +902,28 @@ def main():
 
     device_id = os.environ.get("DEVICE_IDENTIFIER", "STP 10.0-3AV-40")
     inverter_ip = os.environ.get("INVERTER_IP", args.inverter_ip)
-    forward_writes = os.environ.get("FORWARD_WRITES", "true").lower() in ("1", "true", "yes")
+    forward_writes = os.environ.get("FORWARD_WRITES", "false").lower() in ("1", "true", "yes")
+    log_level = os.environ.get("LOG_LEVEL", "info").lower()
 
     if args.options and Path(args.options).exists():
         opts = json.loads(Path(args.options).read_text())
         inverter_ip = opts.get("inverter_ip", inverter_ip)
         device_id = opts.get("device_identifier", device_id)
         forward_writes = opts.get("forward_writes", forward_writes)
+        log_level = str(opts.get("log_level", log_level)).lower()
+
+    # Apply log level (debug shows per-minute AC/DC + poll-interval changes;
+    # info/warning keeps just startup, writes, errors)
+    level = {"debug": logging.DEBUG, "info": logging.INFO,
+             "warning": logging.WARNING}.get(log_level, logging.INFO)
+    logging.getLogger("sma_proxy").setLevel(level)
+    logging.getLogger("sma_proxy.writes").setLevel(level)
 
     if not inverter_ip:
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
         return
 
-    log.info("SMA Modbus Proxy v%s", VERSION)
+    log.info("SMA Modbus Proxy v%s  (log_level=%s)", VERSION, log_level)
 
     # Auto-detect serial and max power from inverter
     log.info("Reading identity from inverter at %s...", inverter_ip)
@@ -835,22 +966,35 @@ def main():
         single=False,
     )
 
-    # Optional: forward external writes from EMS to the real inverter.
-    # Uses a dedicated client to avoid blocking the poll loop. The inverter
-    # must be configured for external control ("Externe Vorgabe durch
-    # Kommunikation" in the SMA WebUI) — otherwise writes will be rejected.
-    if forward_writes:
-        log.info("Write forwarding enabled — EMS writes will be passed to the inverter")
+    # Discovery: walk SunSpec model chain on the real inverter to find Model 123
+    # (the writable control model). Required for translating legacy gridX writes.
+    m123_data_wire = None
+    discovered = discover_sunspec_models(inverter_ip, INVERTER_UNIT_ID)
+    if 123 in discovered:
+        m123_data_wire = discovered[123]
+        log.info("✓ SunSpec Model 123 (Immediate Controls) discovered @ wire %d",
+                 m123_data_wire)
+        log.info("  → WMaxLimPct  @ wire %d", m123_data_wire + M123_OFFSET["WMaxLimPct"])
+        log.info("  → WMaxLim_Ena @ wire %d", m123_data_wire + M123_OFFSET["WMaxLim_Ena"])
+    else:
+        log.warning("⚠ Model 123 not found on inverter — write translation disabled")
+
+    # Optional: translate + forward external writes from EMS to the real inverter.
+    # Uses a dedicated client to avoid blocking the poll loop. Translation maps
+    # gridX legacy SMA addresses (40024 etc.) to SunSpec Model 123 writes.
+    if forward_writes and m123_data_wire is not None:
+        log.info("Write forwarding ENABLED — legacy gridX writes will be translated to Model 123")
         fwd_client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
         if fwd_client.connect():
-            LoggingDataBlock.enable_forwarding(fwd_client, INVERTER_UNIT_ID)
-            log.info("Forwarding client connected (unit=%d)", INVERTER_UNIT_ID)
+            LoggingDataBlock.enable_forwarding(fwd_client, INVERTER_UNIT_ID, m123_data_wire)
+            log.info("Forwarding client connected (unit=%d, M123 base wire=%d)",
+                     INVERTER_UNIT_ID, m123_data_wire)
         else:
             log.error("Forwarding client could not connect — write-through disabled")
+    elif forward_writes:
+        log.warning("Write forwarding requested but Model 123 not discovered — disabled")
     else:
-        log.warning(
-            "⚠ Write forwarding DISABLED — STP will run at default cos φ=1 (no grid-code Q(P) compliance)"
-        )
+        log.info("Write forwarding disabled (forward_writes=false) — writes logged only")
 
     # Start inverter poll thread
     threading.Thread(

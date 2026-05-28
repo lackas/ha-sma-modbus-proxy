@@ -1,11 +1,12 @@
 name: SMA Modbus Proxy
-version: "2.1.0"
+version: "2.2.0"
 slug: sma_modbus_proxy
 description: >-
   Modbus TCP proxy for SMA SunSpec inverters. Reads SunSpec Model 103/160
   from the inverter and serves them at standard addresses for energy
-  management systems (e.g., Viessmann Gridbox) that can't discover the
-  inverter directly.
+  management systems (e.g., Viessmann Gridbox). When forward_writes is
+  enabled, legacy EMS writes (WMaxLimPct) are translated to SunSpec
+  Model 123 writes on the real inverter.
 url: "https://github.com/lackas/ha-sma-modbus-proxy"
 arch:
   - aarch64
@@ -16,8 +17,10 @@ host_network: true
 options:
   inverter_ip: ""
   device_identifier: "STP 10.0-3AV-40"
-  forward_writes: true
+  forward_writes: false
+  log_level: info
 schema:
   inverter_ip: str
   device_identifier: "str?"
   forward_writes: bool
+  log_level: "list(debug|info|warning)?"
