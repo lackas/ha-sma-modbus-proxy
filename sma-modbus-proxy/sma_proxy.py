@@ -32,7 +32,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 
 # ---------------------------------------------------------------------------
 # External-write handling: log + translate + forward (Modbus FC6 / FC16 from
@@ -846,14 +846,17 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
         # Reset error backoff on success
         error_backoff = POLL_ERROR_MIN
 
-        # Throttle detection
+        # Throttle detection (DEBUG only — expected consequence of our own
+        # curtailment writes, so state=5 is tautological with Curtailment STARTED.
+        # A genuine anomaly detector for state=5 *without* a recent curtailment
+        # command could be added later if needed.)
         if state == 5 and not was_throttled:
-            log.warning("Inverter throttled (state=5)")
+            log.debug("Inverter throttled (state=5)")
             was_throttled = True
             throttle_start = time.monotonic()
         elif state != 5 and was_throttled:
             duration = time.monotonic() - throttle_start
-            log.info("Inverter no longer throttled (state=%d) — was throttled for %ds", state, int(duration))
+            log.debug("Inverter no longer throttled (state=%d) — was throttled for %ds", state, int(duration))
             was_throttled = False
 
         # Adaptive poll interval: 1s when producing, 60s on standby/night
@@ -875,7 +878,14 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
 
 
 class _ModbusTracker:
-    """Tracks Modbus client connections, reads, and external writes."""
+    """Tracks Modbus client connections, reads, and external writes.
+
+    Connect/disconnect events are aggregated: the first event in a calm period
+    is logged normally; any additional events arriving within BURST_WINDOW_S
+    of each other are held back and summarized once activity quiets down.
+    """
+
+    BURST_WINDOW_S = 5.0
 
     def __init__(self):
         self._clients_seen: set[str] = set()
@@ -883,13 +893,41 @@ class _ModbusTracker:
         self._write_count = 0
         self._last_read_report = 0
         self._last_write_report = 0
+        # Burst aggregator state
+        self._burst_first_t = 0.0
+        self._burst_last_t = 0.0
+        self._burst_connects = 0
+        self._burst_disconnects = 0
+        self._burst_active = False
+
+    def _flush_burst(self):
+        held = self._burst_connects + self._burst_disconnects
+        if held > 0:
+            duration = self._burst_last_t - self._burst_first_t
+            log.info(
+                "Modbus client churn: +%d more events in %.1fs (%d connects, %d disconnects)",
+                held, duration, self._burst_connects, self._burst_disconnects,
+            )
+        self._burst_connects = 0
+        self._burst_disconnects = 0
+        self._burst_active = False
 
     def on_connect(self, connected: bool) -> None:
         """Called by pymodbus trace_connect (True=connect, False=disconnect)."""
-        if connected:
-            log.info("Modbus client connected")
+        now = time.monotonic()
+        if self._burst_active and (now - self._burst_last_t) >= self.BURST_WINDOW_S:
+            self._flush_burst()
+
+        if not self._burst_active:
+            log.info("Modbus client %s", "connected" if connected else "disconnected")
+            self._burst_active = True
+            self._burst_first_t = now
         else:
-            log.info("Modbus client disconnected")
+            if connected:
+                self._burst_connects += 1
+            else:
+                self._burst_disconnects += 1
+        self._burst_last_t = now
 
     def on_read(self):
         self._read_count += 1
@@ -899,6 +937,9 @@ class _ModbusTracker:
 
     def report(self):
         """Called periodically to report activity."""
+        # Flush any stale connection burst so its summary doesn't linger silently
+        if self._burst_active and (time.monotonic() - self._burst_last_t) >= self.BURST_WINDOW_S:
+            self._flush_burst()
         rc = self._read_count
         wc = self._write_count
         rd = rc - self._last_read_report

@@ -1,3 +1,14 @@
+## 2.2.3
+- Inverter throttle state=5 demoted from WARNING to DEBUG. Since v2.2.0
+  curtailment is commanded by the proxy itself, so state=5 is just the
+  inverter's acknowledgment of our own write — not an anomaly.
+- "Inverter no longer throttled" also moved to DEBUG (was INFO).
+- Aggregate connect/disconnect storms: rapid bursts (>1 event within 5s)
+  collapse into a single `Modbus client churn: +N more events …` summary
+  emitted when activity quiets. Sparse events still log normally.
+- WARNING level is now reserved for actual problems only (forward failures,
+  exceptions, inverter connection loss, unknown register writes).
+
 ## 2.2.2
 - Heartbeat only emits while curtailment is active; free-running stays silent.
   (State-change events + 5-min Modbus stats already cover liveness.)
