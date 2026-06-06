@@ -1,3 +1,9 @@
+## 2.2.5
+- Fix `binary_sensor.sma_curtailed` getting stuck "on" after a release at
+  pct=100 (gridX can write `pct=100, ena=1` before releasing — display pct
+  didn't move, so the dedup skipped the off-push). Now dedup tracks
+  (pct, curtailed) together; either flip triggers a push.
+
 ## 2.2.4
 - Push curtailment state to Home Assistant via Supervisor API. Creates
   `sensor.sma_curtailment_setpoint` (% integer) and

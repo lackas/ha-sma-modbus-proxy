@@ -33,7 +33,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.4"
+VERSION = "2.2.5"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -267,9 +267,11 @@ class _CurtailmentTracker:
         self._pct_min: float | None = None
         self._pct_max: float | None = None
         self._last_write_ts: float = 0.0
-        # HA push dedup: track last integer % pushed. Sub-percent jitter
-        # (95.01 → 95.03) rounds to the same int and is skipped.
-        self._last_pushed_pct_int: int | None = None
+        # HA push dedup: track last pushed (pct_int, curtailed_bool). Push
+        # only when either changes. Both checks are needed: gridX can write
+        # (pct=100, ena=1) before releasing, so a release at pct=100 still
+        # needs to flip the binary_sensor even though pct didn't move.
+        self._last_pushed: tuple[int, bool] | None = None
 
     def record(self, pct_raw: int, ena: int) -> None:
         """Record one translate event and emit state-change INFO if needed."""
@@ -296,13 +298,14 @@ class _CurtailmentTracker:
             label = "curtailed" if new_state == "curtailed" else "free"
             log.info("First translate: STP X %s (setpoint %.2f %%)", label, pct)
 
-        # Push to HA when the effective setpoint moves by ≥1 %. "Free"
-        # always means 100 % regardless of last raw pct write, so a release
-        # reliably triggers a push (95 → 100).
-        display_pct_int = round(pct) if new_state == "curtailed" else 100
-        if display_pct_int != self._last_pushed_pct_int:
-            _push_curtailment(display_pct_int, new_state == "curtailed")
-            self._last_pushed_pct_int = display_pct_int
+        # Push when either setpoint or curtailment state changes. "Free"
+        # always reports as 100 % regardless of last raw pct write.
+        curtailed = (new_state == "curtailed")
+        display_pct_int = round(pct) if curtailed else 100
+        snapshot = (display_pct_int, curtailed)
+        if snapshot != self._last_pushed:
+            _push_curtailment(display_pct_int, curtailed)
+            self._last_pushed = snapshot
 
     def emit_heartbeat(self) -> None:
         """Called every 60 s — log INFO summary only while curtailment is active.
@@ -337,7 +340,7 @@ class _CurtailmentTracker:
             last_int = round(last)
             _push_curtailment(last_int, True)
             with self._lock:
-                self._last_pushed_pct_int = last_int
+                self._last_pushed = (last_int, True)
 
 
 _curtailment_tracker = _CurtailmentTracker()
