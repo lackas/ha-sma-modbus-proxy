@@ -71,6 +71,27 @@ hardcoded model name is **critical** — changing it breaks the entire purpose.
 - **Model name** (`"STP 10.0-3AV-40"`): hardcoded fake identity for Gridbox discovery
 - **SMA proprietary registers** (30003, 30051, 30053, etc.): written to local store only, never read from inverter (they don't exist on STP X)
 
+## Release Process
+
+1. **Bump version** in two places (must match):
+   - `sma-modbus-proxy/sma_proxy.py` → `VERSION = "X.Y.Z"`
+   - `sma-modbus-proxy/config.yaml` → `version: "X.Y.Z"`
+2. **Update `sma-modbus-proxy/CHANGELOG.md`** — new `## X.Y.Z` block at top
+3. **Syntax-check**: `~/src/venv/ha/bin/python3 -c "import ast; ast.parse(open('sma-modbus-proxy/sma_proxy.py').read())"`
+4. **Commit on `main`** (no PR, no branch — single-maintainer repo):
+   ```bash
+   git add sma-modbus-proxy/{CHANGELOG.md,config.yaml,sma_proxy.py}
+   git commit -m "Release X.Y.Z: <one-line summary>"
+   ```
+5. **Tag** the commit: `git tag vX.Y.Z`
+6. **Push** both: `git push origin main && git push origin vX.Y.Z`
+7. **Supervisor pickup**: HA-Add-on store caches the repo — user has to reload
+   manually to see the new version:
+   **Settings → Add-ons → Add-on Store → ⋮ → Check for updates**
+   (a long-lived HA token alone can't trigger this — `/api/hassio/*` needs a
+   Supervisor token. Restart endpoint sometimes works empty-200, info doesn't.)
+8. After reload, update banner appears on the add-on page → click Update.
+
 ## Testing
 
 Use `mbpoll` from local machine to test register reads:
