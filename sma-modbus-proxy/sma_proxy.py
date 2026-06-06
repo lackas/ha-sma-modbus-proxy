@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+import requests
 from pymodbus.client import ModbusTcpClient
 from pymodbus.datastore import ModbusDeviceContext, ModbusServerContext, ModbusSequentialDataBlock
 from pymodbus.server import StartTcpServer
@@ -32,7 +33,52 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.3"
+VERSION = "2.2.4"
+
+# ---------------------------------------------------------------------------
+# Home Assistant push (Supervisor API)
+# ---------------------------------------------------------------------------
+# Inside an HA add-on, SUPERVISOR_TOKEN is auto-injected by the supervisor
+# when homeassistant_api: true is set in config.yaml. The proxy POSTs only
+# on curtailment state-change events + 1/min heartbeat while active — no
+# polling load on HA.
+
+HA_API = "http://supervisor/core/api"
+HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+_ha_push_enabled = False
+
+
+def _push_ha_state(entity_id: str, state, attributes: dict | None = None) -> None:
+    if not _ha_push_enabled or not HA_TOKEN:
+        return
+    try:
+        requests.post(
+            f"{HA_API}/states/{entity_id}",
+            headers={"Authorization": f"Bearer {HA_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"state": state, "attributes": attributes or {}},
+            timeout=2,
+        )
+    except Exception as e:
+        log.warning("HA push failed (%s): %s", entity_id, e)
+
+
+def _push_curtailment(pct_int: int, curtailed: bool) -> None:
+    _push_ha_state(
+        "sensor.sma_curtailment_setpoint",
+        pct_int,
+        {"unit_of_measurement": "%",
+         "friendly_name": "SMA Curtailment Setpoint",
+         "icon": "mdi:transmission-tower-off"},
+    )
+    _push_ha_state(
+        "binary_sensor.sma_curtailed",
+        "on" if curtailed else "off",
+        {"friendly_name": "SMA Curtailed",
+         "device_class": "problem",
+         "setpoint_pct": pct_int,
+         "icon": "mdi:transmission-tower-off"},
+    )
 
 # ---------------------------------------------------------------------------
 # External-write handling: log + translate + forward (Modbus FC6 / FC16 from
@@ -221,6 +267,9 @@ class _CurtailmentTracker:
         self._pct_min: float | None = None
         self._pct_max: float | None = None
         self._last_write_ts: float = 0.0
+        # HA push dedup: track last integer % pushed. Sub-percent jitter
+        # (95.01 → 95.03) rounds to the same int and is skipped.
+        self._last_pushed_pct_int: int | None = None
 
     def record(self, pct_raw: int, ena: int) -> None:
         """Record one translate event and emit state-change INFO if needed."""
@@ -246,6 +295,14 @@ class _CurtailmentTracker:
         elif old_state == "unknown":
             label = "curtailed" if new_state == "curtailed" else "free"
             log.info("First translate: STP X %s (setpoint %.2f %%)", label, pct)
+
+        # Push to HA when the effective setpoint moves by ≥1 %. "Free"
+        # always means 100 % regardless of last raw pct write, so a release
+        # reliably triggers a push (95 → 100).
+        display_pct_int = round(pct) if new_state == "curtailed" else 100
+        if display_pct_int != self._last_pushed_pct_int:
+            _push_curtailment(display_pct_int, new_state == "curtailed")
+            self._last_pushed_pct_int = display_pct_int
 
     def emit_heartbeat(self) -> None:
         """Called every 60 s — log INFO summary only while curtailment is active.
@@ -274,6 +331,13 @@ class _CurtailmentTracker:
         else:
             log.info("Curtailment: %d writes, %.2f–%.2f %% (now %.2f %%)",
                      count, pct_min, pct_max, last)
+        # 1/min heartbeat-refresh to HA while actively curtailed — recovers
+        # the sensor state if HA restarted or lost the original push.
+        if last is not None:
+            last_int = round(last)
+            _push_curtailment(last_int, True)
+            with self._lock:
+                self._last_pushed_pct_int = last_int
 
 
 _curtailment_tracker = _CurtailmentTracker()
@@ -1048,6 +1112,7 @@ def main():
     inverter_ip = os.environ.get("INVERTER_IP", args.inverter_ip)
     forward_writes = os.environ.get("FORWARD_WRITES", "false").lower() in ("1", "true", "yes")
     log_level = os.environ.get("LOG_LEVEL", "info").lower()
+    ha_push = os.environ.get("HA_PUSH", "true").lower() in ("1", "true", "yes")
 
     if args.options and Path(args.options).exists():
         opts = json.loads(Path(args.options).read_text())
@@ -1055,6 +1120,10 @@ def main():
         device_id = opts.get("device_identifier", device_id)
         forward_writes = opts.get("forward_writes", forward_writes)
         log_level = str(opts.get("log_level", log_level)).lower()
+        ha_push = opts.get("ha_push", ha_push)
+
+    global _ha_push_enabled
+    _ha_push_enabled = bool(ha_push) and bool(HA_TOKEN)
 
     # Apply log level (debug shows per-minute AC/DC + poll-interval changes;
     # info/warning keeps just startup, writes, errors)
@@ -1067,7 +1136,12 @@ def main():
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
         return
 
-    log.info("SMA Modbus Proxy v%s  (log_level=%s)", VERSION, log_level)
+    log.info("SMA Modbus Proxy v%s  (log_level=%s, ha_push=%s)",
+             VERSION, log_level,
+             "on" if _ha_push_enabled else ("off" if not ha_push else "no SUPERVISOR_TOKEN"))
+
+    # Seed HA entities at startup so they exist before the first curtailment.
+    _push_curtailment(100, False)
 
     # Auto-detect serial and max power from inverter
     log.info("Reading identity from inverter at %s...", inverter_ip)

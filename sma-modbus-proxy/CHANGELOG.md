@@ -1,3 +1,9 @@
+## 2.2.4
+- Push curtailment state to Home Assistant via Supervisor API. Creates
+  `sensor.sma_curtailment_setpoint` (% integer) and
+  `binary_sensor.sma_curtailed` on first event. Pushes on setpoint change
+  plus a 1/min heartbeat while curtailed. Disable via `ha_push: false`.
+
 ## 2.2.3
 - Inverter throttle state=5 demoted from WARNING to DEBUG. Since v2.2.0
   curtailment is commanded by the proxy itself, so state=5 is just the

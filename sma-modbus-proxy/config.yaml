@@ -1,5 +1,5 @@
 name: SMA Modbus Proxy
-version: "2.2.3"
+version: "2.2.4"
 slug: sma_modbus_proxy
 description: >-
   Modbus TCP proxy for SMA SunSpec inverters. Reads SunSpec Model 103/160
@@ -14,13 +14,16 @@ arch:
   - armv7
 init: false
 host_network: true
+homeassistant_api: true
 options:
   inverter_ip: ""
   device_identifier: "STP 10.0-3AV-40"
   forward_writes: false
   log_level: info
+  ha_push: true
 schema:
   inverter_ip: str
   device_identifier: "str?"
   forward_writes: bool
   log_level: "list(debug|info|warning)?"
+  ha_push: bool
