@@ -33,7 +33,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.5"
+VERSION = "2.2.6"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -52,13 +52,16 @@ def _push_ha_state(entity_id: str, state, attributes: dict | None = None) -> Non
     if not _ha_push_enabled or not HA_TOKEN:
         return
     try:
-        requests.post(
+        r = requests.post(
             f"{HA_API}/states/{entity_id}",
             headers={"Authorization": f"Bearer {HA_TOKEN}",
                      "Content-Type": "application/json"},
             json={"state": state, "attributes": attributes or {}},
             timeout=2,
         )
+        if not r.ok:
+            log.warning("HA push %s returned HTTP %d: %s",
+                        entity_id, r.status_code, r.text[:120])
     except Exception as e:
         log.warning("HA push failed (%s): %s", entity_id, e)
 
@@ -79,6 +82,49 @@ def _push_curtailment(pct_int: int, curtailed: bool) -> None:
          "setpoint_pct": pct_int,
          "icon": "mdi:transmission-tower-off"},
     )
+
+
+# SunSpec Model 103 St (Operating State) enum — see SunSpec Inverter Model spec.
+OP_STATE_NAMES = {
+    1: "off",
+    2: "sleeping",
+    3: "starting",
+    4: "mppt",
+    5: "throttled",
+    6: "shutting_down",
+    7: "fault",
+    8: "standby",
+}
+
+# Push dedup + heartbeat for operating state. Single-threaded poller, no lock.
+_last_op_state_pushed: int | None = None
+_last_op_state_push_t: float = 0.0
+OP_STATE_HEARTBEAT_S = 300   # re-seed every 5 min so HA restarts recover quickly
+
+
+def _push_operating_state(st: int) -> None:
+    name = OP_STATE_NAMES.get(st, f"unknown_{st}")
+    _push_ha_state(
+        "sensor.sma_operating_state",
+        name,
+        {"friendly_name": "SMA Operating State",
+         "icon": "mdi:solar-power",
+         "sunspec_st": st},
+    )
+
+
+def _maybe_push_op_state(st: int) -> None:
+    global _last_op_state_pushed, _last_op_state_push_t
+    now_t = time.monotonic()
+    if st != _last_op_state_pushed or (now_t - _last_op_state_push_t) >= OP_STATE_HEARTBEAT_S:
+        _push_operating_state(st)
+        _last_op_state_pushed = st
+        _last_op_state_push_t = now_t
+
+
+# Last-read Model 103 inverter temperatures (°C). Updated each poll, logged
+# at INFO every 5 min by inverter_poll_loop. None = not implemented by inverter.
+_last_temps: dict[str, float | None] = {"cab": None, "snk": None, "trns": None, "oth": None}
 
 # ---------------------------------------------------------------------------
 # External-write handling: log + translate + forward (Modbus FC6 / FC16 from
@@ -259,6 +305,11 @@ class _CurtailmentTracker:
     setpoint range so the log shows "things are working" without spam.
     """
 
+    # Free-running heartbeat: re-push (100, False) every N 60-s ticks so HA
+    # restarts at night recover the entity within 5 min instead of staying
+    # ghost until the next curtailment event.
+    FREE_HEARTBEAT_TICKS = 5
+
     def __init__(self):
         self._lock = threading.Lock()
         self._state = "unknown"          # "free" | "curtailed" | "unknown"
@@ -272,6 +323,7 @@ class _CurtailmentTracker:
         # (pct=100, ena=1) before releasing, so a release at pct=100 still
         # needs to flip the binary_sensor even though pct didn't move.
         self._last_pushed: tuple[int, bool] | None = None
+        self._free_tick_counter = 0
 
     def record(self, pct_raw: int, ena: int) -> None:
         """Record one translate event and emit state-change INFO if needed."""
@@ -326,7 +378,19 @@ class _CurtailmentTracker:
             self._pct_max = None
 
         if state != "curtailed":
+            # Free-running 5-min heartbeat: re-push (100, off) so HA restarts
+            # recover the entity even at night when no state changes happen.
+            self._free_tick_counter += 1
+            if self._free_tick_counter >= self.FREE_HEARTBEAT_TICKS:
+                self._free_tick_counter = 0
+                _push_curtailment(100, False)
+                with self._lock:
+                    self._last_pushed = (100, False)
             return
+
+        # Active curtailment: reset free-heartbeat counter so a new free run
+        # starts its 5-min clock fresh.
+        self._free_tick_counter = 0
 
         if pct_min == pct_max:
             log.info("Curtailment: %d writes, setpoint %.2f %% (steady)",
@@ -699,10 +763,22 @@ def _poll_inverter_impl(client: ModbusTcpClient, store: ModbusDeviceContext,
     dc_v = _safe_u16(d[27]) * 10**dcv_sf
     dc_w = _safe_s16(d[29]) * 10**dcw_sf
 
+    # Temperatures (Model 103 d[31..34], SF at d[35]). Not-implemented = 0x8000.
+    tmp_sf = _sf(d[35])
+    def _tmp(raw: int) -> float | None:
+        return _safe_s16(raw) * 10**tmp_sf if raw != 0x8000 else None
+    _last_temps["cab"]  = _tmp(d[31])
+    _last_temps["snk"]  = _tmp(d[32])
+    _last_temps["trns"] = _tmp(d[33])
+    _last_temps["oth"]  = _tmp(d[34])
+
     state = _safe_u16(d[36])  # SunSpec operating state
     # Map to v1 convention if not-impl (nighttime returns 0xFFFF -> 0)
     if state == 0:
         state = 3 if power == 0 else 4  # Standby or MPPT
+
+    # Push operating state to HA on change + 5-min heartbeat
+    _maybe_push_op_state(state)
 
     # --- Parse Model 160 per-MPPT data ---
     # Header: m[0]=model_id, m[1]=length
@@ -871,6 +947,9 @@ POLL_ERROR_MIN = 5    # First error retry: 5s
 POLL_ERROR_MAX = 300  # Max error backoff: 5 min
 
 
+TEMP_LOG_INTERVAL_S = 300   # log inverter temperatures every 5 min at INFO
+
+
 def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
     """Continuously poll the inverter and update the register map."""
     poll_count = [0]
@@ -879,6 +958,7 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
     prev_interval = None
     was_throttled = False
     throttle_start = 0
+    last_temp_log_t = 0.0
 
     while True:
         if client is None:
@@ -912,6 +992,15 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
 
         # Reset error backoff on success
         error_backoff = POLL_ERROR_MIN
+
+        # Periodic temperature log (INFO every 5 min — silently skips fields
+        # the inverter doesn't implement).
+        now_t = time.monotonic()
+        if now_t - last_temp_log_t >= TEMP_LOG_INTERVAL_S:
+            last_temp_log_t = now_t
+            parts = [f"{k}={v:.1f}°C" for k, v in _last_temps.items() if v is not None]
+            if parts:
+                log.info("Temperatures: %s", " ".join(parts))
 
         # Throttle detection (DEBUG only — expected consequence of our own
         # curtailment writes, so state=5 is tautological with Curtailment STARTED.

@@ -1,3 +1,18 @@
+## 2.2.6
+- Push SunSpec operating state to HA as `sensor.sma_operating_state` (text:
+  off/sleeping/starting/mppt/throttled/shutting_down/fault/standby; raw int
+  in `sunspec_st` attribute). Pushes on every change plus a 5-min heartbeat
+  so HA restarts recover within 5 min.
+- Free-running curtailment heartbeat: re-push `(setpoint=100, off)` every
+  5 min even when not curtailed. Fixes the night/HA-restart gap where the
+  pushed entities went ghost until the next curtailment event.
+- Parse Model 103 temperatures (Tmp_Cab/Snk/Trns/Oth) at scale factor d[35]
+  and log them at INFO every 5 min. Fields the inverter doesn't implement
+  are silently skipped.
+- `_push_ha_state` now checks `response.ok` — previously HTTP 4xx/5xx
+  responses (e.g. expired SUPERVISOR_TOKEN, supervisor unreachable) were
+  silently swallowed. Now they log as WARNING with status code + body.
+
 ## 2.2.5
 - Fix `binary_sensor.sma_curtailed` getting stuck "on" after a release at
   pct=100 (gridX can write `pct=100, ena=1` before releasing — display pct
