@@ -78,19 +78,27 @@ hardcoded model name is **critical** — changing it breaks the entire purpose.
    - `sma-modbus-proxy/config.yaml` → `version: "X.Y.Z"`
 2. **Update `sma-modbus-proxy/CHANGELOG.md`** — new `## X.Y.Z` block at top
 3. **Syntax-check**: `~/src/venv/ha/bin/python3 -c "import ast; ast.parse(open('sma-modbus-proxy/sma_proxy.py').read())"`
-4. **Commit on `main`** (no PR, no branch — single-maintainer repo):
+4. **Commit, tag, push — all four steps as one block on `main`** (no PR, no
+   branch — single-maintainer repo). Do not skip the tag push: HA reads the
+   add-on version from `config.yaml`, but every prior release in this repo
+   carries a matching `vX.Y.Z` tag — drop the habit and history gets messy.
    ```bash
    git add sma-modbus-proxy/{CHANGELOG.md,config.yaml,sma_proxy.py}
    git commit -m "Release X.Y.Z: <one-line summary>"
+   git tag vX.Y.Z
+   git push origin main
+   git push origin vX.Y.Z
    ```
-5. **Tag** the commit: `git tag vX.Y.Z`
-6. **Push** both: `git push origin main && git push origin vX.Y.Z`
-7. **Supervisor pickup**: HA-Add-on store caches the repo — user has to reload
+5. **Verify** both ref and tag landed on GitHub before announcing done:
+   ```bash
+   git ls-remote --tags origin | tail -3   # vX.Y.Z must appear
+   ```
+6. **Supervisor pickup**: HA-Add-on store caches the repo — user has to reload
    manually to see the new version:
    **Settings → Add-ons → Add-on Store → ⋮ → Check for updates**
    (a long-lived HA token alone can't trigger this — `/api/hassio/*` needs a
    Supervisor token. Restart endpoint sometimes works empty-200, info doesn't.)
-8. After reload, update banner appears on the add-on page → click Update.
+7. After reload, update banner appears on the add-on page → click Update.
 
 ## Testing
 
