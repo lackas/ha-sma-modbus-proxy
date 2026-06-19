@@ -1,3 +1,14 @@
+## 2.2.7
+- Self-heal forward client on persistent error. Any exception during a
+  Model 123 write (broken pipe, timeout, connection reset) now closes the
+  forward client so the next call reconnects fresh. Previously the proxy
+  would log a warning per failed write but keep reusing the dead socket
+  indefinitely, requiring an add-on restart. Triggered in practice when
+  the HA host got a new DHCP lease: the proxy's forward TCP socket was
+  bound to the old source IP and silently rejected by the inverter, while
+  the read-side `inverter_poll_loop` (which already had self-heal) kept
+  working.
+
 ## 2.2.6
 - Push SunSpec operating state to HA as `sensor.sma_operating_state` (text:
   off/sleeping/starting/mppt/throttled/shutting_down/fault/standby; raw int

@@ -33,7 +33,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.6"
+VERSION = "2.2.7"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -470,7 +470,15 @@ def _translate_legacy_to_m123(client, m123_data_wire: int, unit_id: int,
                 wlog.debug("  ✓ wire %d = %d (M123 WMaxLim_Ena)",
                            m123_data_wire + M123_OFFSET["WMaxLim_Ena"], ena)
         except Exception as e:
-            wlog.warning("  ✗ translate exception: %s", e)
+            wlog.warning("  ✗ translate exception: %s — closing forward client for fresh reconnect", e)
+            # pymodbus' `connected` flag is not always flipped on EPIPE/timeout,
+            # so the next translate call would reuse the dead socket and fail
+            # again. Force-close here so the `if not client.connected` guard at
+            # the top of the next call sees a broken state and reconnects.
+            try:
+                client.close()
+            except Exception:
+                pass
 
         # Track state for INFO heartbeat / state-change events
         _curtailment_tracker.record(pct_raw, ena)
