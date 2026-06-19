@@ -98,7 +98,16 @@ hardcoded model name is **critical** — changing it breaks the entire purpose.
    **Settings → Add-ons → Add-on Store → ⋮ → Check for updates**
    (a long-lived HA token alone can't trigger this — `/api/hassio/*` needs a
    Supervisor token. Restart endpoint sometimes works empty-200, info doesn't.)
-7. After reload, update banner appears on the add-on page → click Update.
+7. After "Check for updates", the add-on tile shows an "Update available"
+   banner BUT the "Latest version" field on the add-on detail page may still
+   display the previous version for a moment — Supervisor refreshes
+   "available" and "displayed latest" caches independently. Workaround:
+   open the add-on detail page, hard-refresh (Cmd-Shift-R), or wait
+   ~30s and reload. Then "Latest version" matches the new tag and Update
+   becomes clickable.
+8. Update banner appears on the add-on page → click Update. Restart runs
+   automatically; verify via add-on log that `VERSION = "X.Y.Z"` line
+   shows up at startup.
 
 ## Testing
 
