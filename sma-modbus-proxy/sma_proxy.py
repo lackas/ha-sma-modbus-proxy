@@ -33,7 +33,7 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.7"
+VERSION = "2.2.8"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -310,6 +310,12 @@ class _CurtailmentTracker:
     # ghost until the next curtailment event.
     FREE_HEARTBEAT_TICKS = 5
 
+    # No Modbus write for this long while "curtailed" -> assume the inverter
+    # went idle (night) and the last write left us pinned. Release to free.
+    # Active curtailment writes far more often than this, so it never trips
+    # during a genuine cap.
+    CURTAIL_STALE_S = 600
+
     def __init__(self):
         self._lock = threading.Lock()
         self._state = "unknown"          # "free" | "curtailed" | "unknown"
@@ -372,10 +378,22 @@ class _CurtailmentTracker:
             pct_max = self._pct_max
             state = self._state
             last = self._last_pct
+            last_write_ts = self._last_write_ts
             # reset for next interval
             self._writes_in_interval = 0
             self._pct_min = None
             self._pct_max = None
+
+        # state only flips on a write; when the inverter goes idle (night) it
+        # stops writing and we stay pinned at "curtailed" from the last daytime
+        # write, holding a ghost setpoint. Real curtailment writes sub-second,
+        # so a long write-silence means no active control: release to free.
+        if state == "curtailed" and (time.time() - last_write_ts) > self.CURTAIL_STALE_S:
+            with self._lock:
+                self._state = "free"
+            log.info("Curtailment RELEASED (stale, no writes for %.0f s)",
+                     time.time() - last_write_ts)
+            state = "free"
 
         if state != "curtailed":
             # Free-running 5-min heartbeat: re-push (100, off) so HA restarts
@@ -392,7 +410,12 @@ class _CurtailmentTracker:
         # starts its 5-min clock fresh.
         self._free_tick_counter = 0
 
-        if pct_min == pct_max:
+        if count == 0 or pct_min is None:
+            # Still curtailed but no fresh write this interval: report the held
+            # setpoint instead of formatting None.
+            log.info("Curtailment: 0 writes, holding %s %% (steady)",
+                     "?" if last is None else "%.2f" % last)
+        elif pct_min == pct_max:
             log.info("Curtailment: %d writes, setpoint %.2f %% (steady)",
                      count, pct_min)
         else:

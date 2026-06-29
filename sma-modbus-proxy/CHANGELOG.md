@@ -1,3 +1,12 @@
+## 2.2.8
+- Release stale curtailment at night. `state` only flips on a Modbus write, so
+  when the inverter goes idle the tracker stays pinned at `curtailed` from the
+  last daytime write. That crashed the steady heartbeat (`%.2f` on a None pct)
+  and held `sma_curtailment_setpoint` stale, so energy_free saw a phantom
+  curtailment all night. Now `curtailed` with no write for 600 s
+  (`CURTAIL_STALE_S`) releases to free and pushes `(100, off)`; real
+  curtailment writes far more often, so a genuine cap never trips it.
+
 ## 2.2.7
 - Self-heal forward client on persistent error. Any exception during a
   Model 123 write (broken pipe, timeout, connection reset) now closes the
