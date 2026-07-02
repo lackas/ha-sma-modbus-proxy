@@ -1297,20 +1297,18 @@ def main():
     logging.getLogger("sma_proxy.writes").setLevel(level)
 
     # In debug mode, install per-connection tracing (peer IP + disconnect
-    # reason on our own logger). This is the actual signal for diagnosing
-    # client reconnect storms.
+    # reason on our own logger) on top of the normal sma_proxy debug output
+    # (per-minute AC/DC summaries, poll-interval, temperatures). That is the
+    # useful signal for diagnosing client reconnect storms.
     #
-    # We deliberately do NOT unmute pymodbus's own logger here: at DEBUG it
-    # dumps every decoded PDU, and the proxy's own 1 Hz inverter poll alone
-    # floods the log (~2 PDUs/s forever) and buries the client-connection
-    # events. Our wrapper already captures peer + disconnect reason, so the
-    # firehose adds only noise. It stays available behind PYMODBUS_TRACE=1 for
-    # rare packet-level dives (settable via the compose env or add-on run).
+    # pymodbus's own logger is deliberately left at its normal (muted) level:
+    # at DEBUG it dumps every decoded PDU, and the proxy's own 1 Hz inverter
+    # poll alone floods the log (~2 PDUs/s) and buries the connection events.
+    # The tracing wrapper already gives peer + disconnect reason, which is all
+    # we need. (For a rare raw-packet dive, set the "pymodbus.logging" logger to
+    # DEBUG here — one line — but expect a firehose.)
     if level == logging.DEBUG:
         _install_connection_tracing()
-        if os.environ.get("PYMODBUS_TRACE", "").lower() in ("1", "true", "yes"):
-            logging.getLogger("pymodbus.logging").setLevel(logging.DEBUG)
-            logging.getLogger("pymodbus.transport").setLevel(logging.DEBUG)
 
     if not inverter_ip:
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")

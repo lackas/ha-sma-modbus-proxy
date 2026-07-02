@@ -2,9 +2,10 @@
 - Debugging: cut the `debug` firehose. 2.2.9 unmuted pymodbus's own logger,
   which at DEBUG dumps every decoded PDU — and the proxy's own 1 Hz inverter
   poll alone floods the log (~2 PDUs/s) and buries the client-connection
-  events. The connection-tracing wrapper already captures peer + disconnect
-  reason, so `debug` now installs only that. The full pymodbus PDU trace stays
-  available behind `PYMODBUS_TRACE=1` for rare packet-level dives.
+  events. `debug` is back to its normal, useful output (per-minute AC/DC
+  summaries, poll-interval, temperatures) plus the connection-tracing wrapper
+  (peer IP + disconnect reason), which is the actual signal for diagnosing
+  client reconnect storms. pymodbus's own logger stays muted.
 
 ## 2.2.9
 - Debugging: make client reconnect storms diagnosable. In `debug` log level
