@@ -1,3 +1,14 @@
+## 2.2.9
+- Debugging: make client reconnect storms diagnosable. In `debug` log level
+  the proxy now unmutes pymodbus's own logger (`pymodbus.logging`), so
+  connection lifecycle and disconnect reasons ("Connection lost server due to
+  ...") become visible, and wraps the request handler to log the real peer
+  (`conn OPEN peer=...` / `conn CLOSE peer=... reason=...`). Together these tell
+  us whether a connect burst is one client flapping or many, and why each
+  connection drops. Both are debug-gated; `info`/`warning` output is unchanged.
+- The 5-minute inverter temperature line dropped from INFO to DEBUG (not useful
+  at INFO).
+
 ## 2.2.8
 - Release stale curtailment at night. `state` only flips on a Modbus write, so
   when the inverter goes idle the tracker stays pinned at `curtailed` from the

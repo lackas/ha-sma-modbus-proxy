@@ -33,7 +33,48 @@ logging.getLogger("pymodbus.transport").setLevel(logging.INFO)
 log = logging.getLogger("sma_proxy")
 wlog = logging.getLogger("sma_proxy.writes")
 
-VERSION = "2.2.8"
+
+def _install_connection_tracing() -> None:
+    """Log peer IP:port + disconnect reason for every client connection.
+
+    pymodbus labels every accepted server connection "server" with no peer
+    info, so a reconnect storm can't be attributed to one client vs. many, and
+    its own lifecycle lines only surface if the "pymodbus.logging" logger is
+    unmuted. To make the FIRST capture conclusive, wrap the request handler's
+    connect/disconnect callbacks and log the real peer + the close exception on
+    our own logger (DEBUG, so silent at info/warning). Guarded so an unexpected
+    pymodbus layout can never crash the proxy — worst case we lose peer detail
+    and still have the unmuted pymodbus logs.
+    """
+    try:
+        from pymodbus.server.requesthandler import ServerRequestHandler as _SRH
+    except Exception as e:  # pragma: no cover - version guard
+        log.debug("Connection tracing not installed (import failed): %s", e)
+        return
+
+    _orig_made = _SRH.connection_made
+    _orig_lost = _SRH.connection_lost
+
+    def _made(self, transport):
+        try:
+            log.debug("conn OPEN  peer=%s", transport.get_extra_info("peername"))
+        except Exception:
+            pass
+        return _orig_made(self, transport)
+
+    def _lost(self, exc):
+        try:
+            peer = self.transport.get_extra_info("peername") if self.transport else None
+        except Exception:
+            peer = None
+        log.debug("conn CLOSE peer=%s reason=%r", peer, exc)
+        return _orig_lost(self, exc)
+
+    _SRH.connection_made = _made
+    _SRH.connection_lost = _lost
+    log.debug("Connection tracing installed (peer + disconnect reason)")
+
+VERSION = "2.2.9"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -123,7 +164,7 @@ def _maybe_push_op_state(st: int) -> None:
 
 
 # Last-read Model 103 inverter temperatures (°C). Updated each poll, logged
-# at INFO every 5 min by inverter_poll_loop. None = not implemented by inverter.
+# at DEBUG every 5 min by inverter_poll_loop. None = not implemented by inverter.
 _last_temps: dict[str, float | None] = {"cab": None, "snk": None, "trns": None, "oth": None}
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1019,7 @@ POLL_ERROR_MIN = 5    # First error retry: 5s
 POLL_ERROR_MAX = 300  # Max error backoff: 5 min
 
 
-TEMP_LOG_INTERVAL_S = 300   # log inverter temperatures every 5 min at INFO
+TEMP_LOG_INTERVAL_S = 300   # log inverter temperatures every 5 min at DEBUG
 
 
 def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
@@ -1024,14 +1065,14 @@ def inverter_poll_loop(inverter_ip: str, store: ModbusDeviceContext):
         # Reset error backoff on success
         error_backoff = POLL_ERROR_MIN
 
-        # Periodic temperature log (INFO every 5 min — silently skips fields
+        # Periodic temperature log (DEBUG every 5 min — silently skips fields
         # the inverter doesn't implement).
         now_t = time.monotonic()
         if now_t - last_temp_log_t >= TEMP_LOG_INTERVAL_S:
             last_temp_log_t = now_t
             parts = [f"{k}={v:.1f}°C" for k, v in _last_temps.items() if v is not None]
             if parts:
-                log.info("Temperatures: %s", " ".join(parts))
+                log.debug("Temperatures: %s", " ".join(parts))
 
         # Throttle detection (DEBUG only — expected consequence of our own
         # curtailment writes, so state=5 is tautological with Curtailment STARTED.
@@ -1254,6 +1295,18 @@ def main():
              "warning": logging.WARNING}.get(log_level, logging.INFO)
     logging.getLogger("sma_proxy").setLevel(level)
     logging.getLogger("sma_proxy.writes").setLevel(level)
+
+    # In debug mode, also unmute pymodbus's own logger. All pymodbus messages
+    # (including connection lifecycle + the disconnect reason,
+    # "Connection lost server due to <exc>") route through the "pymodbus.logging"
+    # logger, which we otherwise pin to INFO. Unmuting it is the only way to see
+    # *why* clients drop — essential for diagnosing reconnect storms. The
+    # _SkipSetValues filter still drops our own poll's setValues spam. Kept muted
+    # at info/warning to avoid per-transaction noise.
+    if level == logging.DEBUG:
+        logging.getLogger("pymodbus.logging").setLevel(logging.DEBUG)
+        logging.getLogger("pymodbus.transport").setLevel(logging.DEBUG)
+        _install_connection_tracing()
 
     if not inverter_ip:
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
