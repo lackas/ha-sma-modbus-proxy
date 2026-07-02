@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.2.9"
+VERSION = "2.2.10"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -1296,17 +1296,21 @@ def main():
     logging.getLogger("sma_proxy").setLevel(level)
     logging.getLogger("sma_proxy.writes").setLevel(level)
 
-    # In debug mode, also unmute pymodbus's own logger. All pymodbus messages
-    # (including connection lifecycle + the disconnect reason,
-    # "Connection lost server due to <exc>") route through the "pymodbus.logging"
-    # logger, which we otherwise pin to INFO. Unmuting it is the only way to see
-    # *why* clients drop — essential for diagnosing reconnect storms. The
-    # _SkipSetValues filter still drops our own poll's setValues spam. Kept muted
-    # at info/warning to avoid per-transaction noise.
+    # In debug mode, install per-connection tracing (peer IP + disconnect
+    # reason on our own logger). This is the actual signal for diagnosing
+    # client reconnect storms.
+    #
+    # We deliberately do NOT unmute pymodbus's own logger here: at DEBUG it
+    # dumps every decoded PDU, and the proxy's own 1 Hz inverter poll alone
+    # floods the log (~2 PDUs/s forever) and buries the client-connection
+    # events. Our wrapper already captures peer + disconnect reason, so the
+    # firehose adds only noise. It stays available behind PYMODBUS_TRACE=1 for
+    # rare packet-level dives (settable via the compose env or add-on run).
     if level == logging.DEBUG:
-        logging.getLogger("pymodbus.logging").setLevel(logging.DEBUG)
-        logging.getLogger("pymodbus.transport").setLevel(logging.DEBUG)
         _install_connection_tracing()
+        if os.environ.get("PYMODBUS_TRACE", "").lower() in ("1", "true", "yes"):
+            logging.getLogger("pymodbus.logging").setLevel(logging.DEBUG)
+            logging.getLogger("pymodbus.transport").setLevel(logging.DEBUG)
 
     if not inverter_ip:
         log.error("No inverter_ip configured. Set it in the add-on config or INVERTER_IP env var.")
