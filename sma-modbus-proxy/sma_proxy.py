@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.2.10"
+VERSION = "2.3.0"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -1265,6 +1265,149 @@ def read_inverter_identity(inverter_ip: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Self-curtailment (best-effort §9 60% cap) — optional, mutually exclusive with
+# forward_writes.
+# ---------------------------------------------------------------------------
+# Closes a control loop the proxy owns: read the *net grid power* from a Tasmota
+# SML meter at ~1 Hz and write SunSpec Model 123 WMaxLimPct on the SMA to keep
+# export at/below a threshold. Because we feed back on the metered net value,
+# the (uncontrolled) second inverter + house load are just disturbances the PI
+# rejects — no plant model, no SMA/VX3 split needed. Only the SMA is
+# controllable; that suffices as long as the second inverter alone stays under
+# the cap (it charges the battery first, so in practice always).
+
+
+def read_grid_export_w(tasmota_url: str, timeout: float = 2.0) -> float:
+    """Net grid power in W from Tasmota SML (negative = export). Raises on error."""
+    r = requests.get(f"{tasmota_url}/cm?cmnd=Status%2010", timeout=timeout)
+    r.raise_for_status()
+    return float(r.json()["StatusSNS"]["SML"]["Power_curr"])
+
+
+def _write_m123_limit(client, m123_data_wire: int, unit_id: int,
+                      pct_raw: int, ena: int) -> bool:
+    """Write WMaxLimPct (0.01%-units, 0..10000) + Ena to Model 123. True on success."""
+    if m123_data_wire is None:
+        return False
+    pdu_pct = (m123_data_wire - 1) + M123_OFFSET["WMaxLimPct"]
+    pdu_ena = (m123_data_wire - 1) + M123_OFFSET["WMaxLim_Ena"]
+    try:
+        if not client.connected and not client.connect():
+            wlog.warning("[curtail] inverter connection lost — write skipped")
+            return False
+        rr = client.write_register(pdu_pct, int(pct_raw), device_id=unit_id)
+        rr2 = client.write_register(pdu_ena, int(ena), device_id=unit_id)
+        if rr.isError() or rr2.isError():
+            wlog.warning("[curtail] M123 write error: pct=%s ena=%s", rr, rr2)
+            return False
+        return True
+    except Exception as e:
+        wlog.warning("[curtail] M123 write exception: %s — closing client", e)
+        try:
+            client.close()
+        except Exception:
+            pass
+        return False
+
+
+class _CurtailController:
+    """PI controller with anti-windup + asymmetric release for export capping.
+
+    State is the curtailment amount c in [0,100] % (0 = SMA free, 100 = SMA off);
+    WMaxLimPct = 100 - c. Error e = export - threshold (>0 when over cap).
+
+    - P term: seeded so a full-rated overshoot maps to ~full cut in one step
+      (the "one step down"); Kp = 100 / SMA_rated.
+    - I term: trims the residual — this is what "learns" the non-linear %→W
+      response and rejects the second-inverter/house disturbances. No margin:
+      setpoint is the threshold itself.
+    - Anti-windup: conditional integration + back-calculation at the rails, and
+      the deadband (limit above current production → no effect) is handled by
+      letting I walk c down until it bites.
+    - Asymmetric: reacts fast when over, releases slowly (best-effort under the
+      line without a static margin).
+
+    Gains are initial values — tune against dry-run midday data.
+    """
+
+    def __init__(self, threshold_w: float, sma_rated_w: float):
+        self.L = float(threshold_w)
+        rated = max(1000.0, float(sma_rated_w))
+        self.kp = 100.0 / rated          # % per W
+        self.ki = self.kp / 6.0          # % per (W·s)
+        self.release_max = 3.0           # %/s max release (slow "up")
+        self.c = 0.0
+        self._i = 0.0
+
+    def update(self, export_w: float, dt: float):
+        e = export_w - self.L
+        p = self.kp * e
+        i_try = self._i + self.ki * e * dt
+        c_try = p + i_try
+        if 0.0 <= c_try <= 100.0:
+            self._i = i_try              # linear region: integrate normally
+            c = c_try
+        else:                            # saturated: back-calculate integral
+            c = 100.0 if c_try > 100.0 else 0.0
+            self._i = min(200.0, max(-200.0, c - p))
+        if c < self.c:                   # asymmetric slow release
+            c = max(c, self.c - self.release_max * dt)
+            self._i = c - p              # hold integral to the rate-limited output
+        self.c = min(100.0, max(0.0, c))
+        return 100.0 - self.c, (1 if self.c > 0.1 else 0)
+
+
+def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
+                         threshold_w, sma_rated_w, dry_run,
+                         interval: float = 1.0, failsafe_after: int = 8):
+    """~1 Hz best-effort export cap. Never raises — self-heals on any error."""
+    pi = _CurtailController(threshold_w, sma_rated_w)
+    fails = 0
+    engaged = False
+    last_hb = 0.0
+    log.info("[curtail] loop start: threshold=%dW dry_run=%s tasmota=%s (kp=%.4f ki=%.4f)",
+             threshold_w, dry_run, tasmota_url, pi.kp, pi.ki)
+    while True:
+        try:
+            export = -read_grid_export_w(tasmota_url)   # W, positive = export
+            fails = 0
+            pct, ena = pi.update(export, interval)
+            pct_raw = min(10000, max(0, int(round(pct * 100))))
+            if dry_run:
+                # Simulate: log only, no SMA write, no HA push.
+                now_eng = pi.c > 0.1
+                if now_eng != engaged:
+                    engaged = now_eng
+                    log.info("[curtail] %s (DRY) — export=%.0fW cap=%d → WMaxLimPct=%.1f%%",
+                             "ENGAGE" if engaged else "RELEASE", export, threshold_w, pct)
+                t = time.monotonic()
+                if engaged and t - last_hb >= 60:
+                    last_hb = t
+                    log.info("[curtail] DRY export=%.0fW → WMaxLimPct=%.1f%% (c=%.1f%%)",
+                             export, pct, pi.c)
+            else:
+                # Self-Adaptive live: write the SMA and reflect the curtailment
+                # value in HA via the tracker (push + STARTED/RELEASED events +
+                # its 60 s heartbeat, driven by the existing _heartbeat_loop).
+                _write_m123_limit(client, m123_data_wire, unit_id, pct_raw, ena)
+                _curtailment_tracker.record(pct_raw, ena)
+        except Exception as ex:
+            fails += 1
+            if fails <= 3 or fails == failsafe_after:
+                log.warning("[curtail] read/control error (%d): %s", fails, ex)
+            if fails == failsafe_after:
+                # Measurement lost → cut the SMA to 0 so we cannot breach the cap
+                # (only the uncontrolled second inverter remains, which alone
+                # stays under it). Yield loss during the outage is the safe trade.
+                log.warning("[curtail] FAIL-SAFE: measurement lost → SMA WMaxLimPct=0%%%s",
+                            " (DRY)" if dry_run else "")
+                if not dry_run:
+                    _write_m123_limit(client, m123_data_wire, unit_id, 0, 1)
+                    _curtailment_tracker.record(0, 1)
+        time.sleep(interval)
+
+
 def main():
     parser = argparse.ArgumentParser(description="SMA Modbus TCP Proxy v2")
     parser.add_argument("--inverter-ip", default=None)
@@ -1275,6 +1418,9 @@ def main():
     device_id = os.environ.get("DEVICE_IDENTIFIER", "STP 10.0-3AV-40")
     inverter_ip = os.environ.get("INVERTER_IP", args.inverter_ip)
     forward_writes = os.environ.get("FORWARD_WRITES", "false").lower() in ("1", "true", "yes")
+    curtailment = os.environ.get("CURTAILMENT", "").strip()
+    curtail_threshold_w = int(os.environ.get("CURTAIL_THRESHOLD_W", "14256"))
+    tasmota_url = os.environ.get("TASMOTA_URL", "http://192.168.1.61")
     log_level = os.environ.get("LOG_LEVEL", "info").lower()
     ha_push = os.environ.get("HA_PUSH", "true").lower() in ("1", "true", "yes")
 
@@ -1283,6 +1429,9 @@ def main():
         inverter_ip = opts.get("inverter_ip", inverter_ip)
         device_id = opts.get("device_identifier", device_id)
         forward_writes = opts.get("forward_writes", forward_writes)
+        curtailment = str(opts.get("curtailment", curtailment))
+        curtail_threshold_w = int(opts.get("curtail_threshold_w", curtail_threshold_w))
+        tasmota_url = opts.get("tasmota_url", tasmota_url)
         log_level = str(opts.get("log_level", log_level)).lower()
         ha_push = opts.get("ha_push", ha_push)
 
@@ -1375,11 +1524,22 @@ def main():
     else:
         log.warning("⚠ Model 123 not found on inverter — write translation disabled")
 
-    # Optional: translate + forward external writes from EMS to the real inverter.
-    # Uses a dedicated client to avoid blocking the poll loop. Translation maps
-    # gridX legacy SMA addresses (40024 etc.) to SunSpec Model 123 writes.
-    if forward_writes and m123_data_wire is not None:
-        log.info("Write forwarding ENABLED — legacy gridX writes will be translated to Model 123")
+    # Curtailment mode: Off | Modbus | Self-Adaptive | Simulate (mutually
+    # exclusive by construction). Legacy fallback: if `curtailment` is unset,
+    # derive from the old forward_writes bool (true→Modbus, false→Off).
+    mode = curtailment.lower().replace("_", "-").replace(" ", "-")
+    if not mode:
+        mode = "modbus" if forward_writes else "off"
+    if mode not in ("off", "modbus", "self-adaptive", "simulate"):
+        log.warning("Unknown curtailment mode %r — falling back to 'off'", curtailment)
+        mode = "off"
+    if m123_data_wire is None and mode != "off":
+        log.warning("curtailment=%s but Model 123 not discovered — disabled", mode)
+        mode = "off"
+
+    if mode == "modbus":
+        # Pass-through: translate gridX legacy writes (40024 …) → Model 123.
+        log.info("Curtailment=Modbus — gridX writes translated & forwarded to Model 123")
         fwd_client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
         if fwd_client.connect():
             LoggingDataBlock.enable_forwarding(fwd_client, INVERTER_UNIT_ID, m123_data_wire)
@@ -1387,10 +1547,26 @@ def main():
                      INVERTER_UNIT_ID, m123_data_wire)
         else:
             log.error("Forwarding client could not connect — write-through disabled")
-    elif forward_writes:
-        log.warning("Write forwarding requested but Model 123 not discovered — disabled")
+    elif mode in ("self-adaptive", "simulate"):
+        dry = (mode == "simulate")
+        if not tasmota_url:
+            log.error("curtailment=%s needs tasmota_url — disabled", mode)
+        else:
+            log.info("Curtailment=%s ENABLED — threshold=%dW, tasmota=%s%s",
+                     mode, curtail_threshold_w, tasmota_url,
+                     " (SIMULATE: computes+logs, no SMA writes/HA push)" if dry else "")
+            curtail_client = None
+            if not dry:
+                curtail_client = ModbusTcpClient(inverter_ip, port=502, timeout=5)
+                curtail_client.connect()
+            threading.Thread(
+                target=curtail_control_loop,
+                args=(curtail_client, m123_data_wire, INVERTER_UNIT_ID, tasmota_url,
+                      curtail_threshold_w, max_power_w, dry),
+                daemon=True,
+            ).start()
     else:
-        log.info("Write forwarding disabled (forward_writes=false) — writes logged only")
+        log.info("Curtailment=Off — proxy serves reads only, no writes")
 
     # Start inverter poll thread
     threading.Thread(

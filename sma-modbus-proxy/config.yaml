@@ -1,12 +1,13 @@
 name: SMA Modbus Proxy
-version: "2.2.10"
+version: "2.3.0"
 slug: sma_modbus_proxy
 description: >-
   Modbus TCP proxy for SMA SunSpec inverters. Reads SunSpec Model 103/160
   from the inverter and serves them at standard addresses for energy
-  management systems (e.g., Viessmann Gridbox). When forward_writes is
-  enabled, legacy EMS writes (WMaxLimPct) are translated to SunSpec
-  Model 123 writes on the real inverter.
+  management systems (e.g., Viessmann Gridbox). Curtailment mode selects how
+  the export limit is enforced: Modbus (translate EMS WMaxLimPct writes to
+  Model 123), Self-Adaptive (PI loop drives the SMA from a Tasmota grid meter),
+  Simulate (same loop, computes+logs only), or Off.
 url: "https://github.com/lackas/ha-sma-modbus-proxy"
 arch:
   - aarch64
@@ -18,12 +19,16 @@ homeassistant_api: true
 options:
   inverter_ip: ""
   device_identifier: "STP 10.0-3AV-40"
-  forward_writes: false
+  curtailment: "Modbus"
+  curtail_threshold_w: 14256
+  tasmota_url: "http://192.168.1.61"
   log_level: info
   ha_push: true
 schema:
   inverter_ip: str
   device_identifier: "str?"
-  forward_writes: bool
+  curtailment: "list(Off|Modbus|Self-Adaptive|Simulate)"
+  curtail_threshold_w: "int?"
+  tasmota_url: "str?"
   log_level: "list(debug|info|warning)?"
   ha_push: bool

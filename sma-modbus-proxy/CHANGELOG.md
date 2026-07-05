@@ -1,3 +1,22 @@
+## 2.3.0
+- Self-adaptive curtailment. New `curtailment` mode replaces `forward_writes`:
+  **Off | Modbus | Self-Adaptive | Simulate** (mutually exclusive by design;
+  legacy `forward_writes: true/false` still maps to Modbus/Off).
+  - **Modbus** — unchanged pass-through: translate EMS `WMaxLimPct` writes → M123.
+  - **Self-Adaptive** — the proxy closes its own control loop: reads net grid
+    power from a Tasmota SML meter (`tasmota_url`, ~1 Hz HTTP) and drives the SMA
+    via M123 `WMaxLimPct` to keep export ≤ `curtail_threshold_w` (default 14256 W
+    = §9 60 %). PI controller with anti-windup, asymmetric (fast down / slow
+    release), no static margin. Because it feeds back on the metered *net* value,
+    the uncontrolled second inverter + house load are just disturbances it
+    rejects — and it will curtail the SMA below its own share (down to 0 %) when
+    the second inverter alone pushes toward the cap. Pushes the curtailment value
+    to HA via the existing tracker. Fail-safe cuts the SMA to 0 % if the meter
+    read fails.
+  - **Simulate** — same loop, computes + logs what it *would* set, no SMA writes,
+    no HA push (validate against real data before going live).
+  - Config: `curtailment`, `curtail_threshold_w` (default 14256), `tasmota_url`.
+
 ## 2.2.10
 - Debugging: cut the `debug` firehose. 2.2.9 unmuted pymodbus's own logger,
   which at DEBUG dumps every decoded PDU — and the proxy's own 1 Hz inverter
