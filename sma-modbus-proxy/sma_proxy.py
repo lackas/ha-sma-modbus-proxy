@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -1322,9 +1322,10 @@ class _CurtailController:
     - I term: trims the residual — this is what "learns" the non-linear %→W
       response and rejects the second-inverter/house disturbances. No margin:
       setpoint is the threshold itself.
-    - Anti-windup: conditional integration + back-calculation at the rails, and
-      the deadband (limit above current production → no effect) is handled by
-      letting I walk c down until it bites.
+    - Anti-windup: the integral STATE is clamped to the physical curtailment
+      range (0..100 %), so it can neither wind up while the output is saturated
+      nor carry a hidden offset while released; the deadband (limit above current
+      production → no effect) is handled by letting I walk c down until it bites.
     - Asymmetric: reacts fast when over, releases slowly (best-effort under the
       line without a static margin).
 
@@ -1334,26 +1335,23 @@ class _CurtailController:
     def __init__(self, threshold_w: float, sma_rated_w: float):
         self.L = float(threshold_w)
         rated = max(1000.0, float(sma_rated_w))
-        self.kp = 100.0 / rated          # % per W
-        self.ki = self.kp / 6.0          # % per (W·s)
+        self.kp = 100.0 / rated          # % per W (full-rated overshoot → ~full cut)
+        self.ki = self.kp / 3.0          # % per (W·s) — holds the steady-state cut
         self.release_max = 3.0           # %/s max release (slow "up")
         self.c = 0.0
         self._i = 0.0
 
     def update(self, export_w: float, dt: float):
-        e = export_w - self.L
+        e = export_w - self.L                    # >0 = over cap
         p = self.kp * e
-        i_try = self._i + self.ki * e * dt
-        c_try = p + i_try
-        if 0.0 <= c_try <= 100.0:
-            self._i = i_try              # linear region: integrate normally
-            c = c_try
-        else:                            # saturated: back-calculate integral
-            c = 100.0 if c_try > 100.0 else 0.0
-            self._i = min(200.0, max(-200.0, c - p))
-        if c < self.c:                   # asymmetric slow release
+        # Integral with clamping anti-windup: the state itself is bounded to the
+        # physical curtailment range (0..100 %), so it can neither wind up while
+        # saturated nor carry a hidden offset while released (which would slam
+        # the SMA the instant export first crosses the cap).
+        self._i = min(100.0, max(0.0, self._i + self.ki * e * dt))
+        c = min(100.0, max(0.0, p + self._i))
+        if c < self.c:                           # asymmetric: slow release only
             c = max(c, self.c - self.release_max * dt)
-            self._i = c - p              # hold integral to the rate-limited output
         self.c = min(100.0, max(0.0, c))
         return 100.0 - self.c, (1 if self.c > 0.1 else 0)
 
@@ -1366,6 +1364,7 @@ def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
     fails = 0
     engaged = False
     last_hb = 0.0
+    last_sim = None
     log.info("[curtail] loop start: threshold=%dW dry_run=%s tasmota=%s (kp=%.4f ki=%.4f)",
              threshold_w, dry_run, tasmota_url, pi.kp, pi.ki)
     while True:
@@ -1375,17 +1374,30 @@ def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
             pct, ena = pi.update(export, interval)
             pct_raw = min(10000, max(0, int(round(pct * 100))))
             if dry_run:
-                # Simulate: log only, no SMA write, no HA push.
+                # Simulate: log + expose to a *separate* HA entity for graphing.
+                # Never writes the SMA and never touches the real curtailment
+                # entities, so it can't imply a curtailment that isn't happening.
+                t = time.monotonic()
                 now_eng = pi.c > 0.1
                 if now_eng != engaged:
                     engaged = now_eng
                     log.info("[curtail] %s (DRY) — export=%.0fW cap=%d → WMaxLimPct=%.1f%%",
                              "ENGAGE" if engaged else "RELEASE", export, threshold_w, pct)
-                t = time.monotonic()
                 if engaged and t - last_hb >= 60:
                     last_hb = t
                     log.info("[curtail] DRY export=%.0fW → WMaxLimPct=%.1f%% (c=%.1f%%)",
                              export, pct, pi.c)
+                # Push to sma_curtail_sim on ≥1 % change or every 30 s (graphable,
+                # low HA load).
+                rp = round(pct)
+                if last_sim is None or abs(rp - last_sim[0]) >= 1 or t - last_sim[1] >= 30:
+                    last_sim = (rp, t)
+                    _push_ha_state("sensor.sma_curtail_sim", rp, {
+                        "unit_of_measurement": "%",
+                        "friendly_name": "SMA Curtail (Simulate)",
+                        "icon": "mdi:transmission-tower-off",
+                        "export_w": round(export), "curtail_pct": round(pi.c, 1),
+                        "engaged": engaged, "threshold_w": threshold_w})
             else:
                 # Self-Adaptive live: write the SMA and reflect the curtailment
                 # value in HA via the tracker (push + STARTED/RELEASED events +

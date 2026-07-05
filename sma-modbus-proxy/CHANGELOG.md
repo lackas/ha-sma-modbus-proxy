@@ -1,3 +1,18 @@
+## 2.3.1
+- Curtailment controller fixes found while validating in Simulate:
+  - **Anti-windup fix:** the integral used back-calculation that wound up while
+    below the cap, which would have slammed the SMA to 0 % the instant export
+    first crossed the threshold (cloudy → sunny). Now the integral *state* is
+    clamped to 0..100 %, so no hidden offset builds up while released.
+  - **ki tuned** kp/6 → kp/3 so the integral can hold the steady-state cut;
+    with a realistic inverter lag the loop now sits on the cap instead of
+    hovering above it. (Gains still provisional — final tune against Simulate
+    data on a real over-cap day.)
+  - **Simulate now graphable:** publishes `sensor.sma_curtail_sim` (WMaxLimPct,
+    with export/curtail/threshold attributes) — a *separate* entity so it never
+    implies real curtailment. The live `sma_curtailment_setpoint` is still only
+    written in Self-Adaptive.
+
 ## 2.3.0
 - Self-adaptive curtailment. New `curtailment` mode replaces `forward_writes`:
   **Off | Modbus | Self-Adaptive | Simulate** (mutually exclusive by design;
