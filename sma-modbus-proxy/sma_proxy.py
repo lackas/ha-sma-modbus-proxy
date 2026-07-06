@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.3.1"
+VERSION = "2.3.3"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -1114,6 +1114,7 @@ class _ModbusTracker:
     """
 
     BURST_WINDOW_S = 5.0
+    WRITE_DRY_MIN = 10.0     # min. dry minutes before announcing a write-side resume
 
     def __init__(self):
         self._clients_seen: set[str] = set()
@@ -1121,6 +1122,7 @@ class _ModbusTracker:
         self._write_count = 0
         self._last_read_report = 0
         self._last_write_report = 0
+        self._write_dry_since = None  # monotonic ts since external writes went dry
         # Burst aggregator state
         self._burst_first_t = 0.0
         self._burst_last_t = 0.0
@@ -1174,6 +1176,21 @@ class _ModbusTracker:
         wd = wc - self._last_write_report
         self._last_read_report = rc
         self._last_write_report = wc
+        # Edge-triggered "gridX write side resumed": announce once when external
+        # writes reappear after a dry spell (the gridX control-dropout signature is
+        # reads alive / writes at 0). Lets the user know it's safe to switch back
+        # to Modbus pass-through mode.
+        now = time.monotonic()
+        if wd > 0:
+            if self._write_dry_since is not None:
+                dry_min = (now - self._write_dry_since) / 60.0
+                if dry_min >= self.WRITE_DRY_MIN:
+                    log.info("gridX write side resumed after ~%.0f min of no writes "
+                             "(+%d) — EMS control is back; safe to switch curtailment to Modbus",
+                             dry_min, wd)
+                self._write_dry_since = None
+        elif self._write_dry_since is None:
+            self._write_dry_since = now
         if rc == 0 and wc == 0:
             log.info("Modbus: idle — no client traffic")
         else:
@@ -1358,8 +1375,14 @@ class _CurtailController:
 
 def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
                          threshold_w, sma_rated_w, dry_run,
-                         interval: float = 1.0, failsafe_after: int = 8):
-    """~1 Hz best-effort export cap. Never raises — self-heals on any error."""
+                         interval: float = 3.0, failsafe_after: int = 8):
+    """Best-effort export cap (~3 s loop). Never raises — self-heals on any error.
+
+    3 s matches the SMA's own ramp rate: a 1 s loop rewrites the limit before the
+    inverter has reached the last one, which made the setpoint hunt ~2-3 %. At 3 s
+    each write settles before the next correction, and the read timeout (2 s) sits
+    comfortably under the tick.
+    """
     pi = _CurtailController(threshold_w, sma_rated_w)
     fails = 0
     engaged = False
@@ -1373,6 +1396,12 @@ def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
             fails = 0
             pct, ena = pi.update(export, interval)
             pct_raw = min(10000, max(0, int(round(pct * 100))))
+            # Per-step tuning trace (DEBUG only): the error, the commanded limit and
+            # the internal PI split (c = total cut %, i = integral state). This is
+            # the only way to tune kp/ki against real closed-loop data on an
+            # over-cap day — silent at info/warning.
+            log.debug("[curtail] export=%.0fW err=%+.0f → WMaxLim=%.1f%% (c=%.1f i=%.1f dt=%.1fs)",
+                      export, export - threshold_w, pct, pi.c, pi._i, interval)
             if dry_run:
                 # Simulate: log + expose to a *separate* HA entity for graphing.
                 # Never writes the SMA and never touches the real curtailment
@@ -1409,14 +1438,16 @@ def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
             if fails <= 3 or fails == failsafe_after:
                 log.warning("[curtail] read/control error (%d): %s", fails, ex)
             if fails == failsafe_after:
-                # Measurement lost → cut the SMA to 0 so we cannot breach the cap
-                # (only the uncontrolled second inverter remains, which alone
-                # stays under it). Yield loss during the outage is the safe trade.
-                log.warning("[curtail] FAIL-SAFE: measurement lost → SMA WMaxLimPct=0%%%s",
+                # Measurement lost → release control, don't cut the SMA. A brief
+                # over-cap on a meter outage beats killing all PV, and it's the
+                # state the plant already runs in uncontrolled.
+                log.warning("[curtail] FAIL-SAFE: measurement lost → release SMA%s",
                             " (DRY)" if dry_run else "")
+                pi.c = 0.0
+                pi._i = 0.0
                 if not dry_run:
-                    _write_m123_limit(client, m123_data_wire, unit_id, 0, 1)
-                    _curtailment_tracker.record(0, 1)
+                    _write_m123_limit(client, m123_data_wire, unit_id, 10000, 0)
+                    _curtailment_tracker.record(10000, 0)
         time.sleep(interval)
 
 

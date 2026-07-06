@@ -1,3 +1,24 @@
+## 2.3.3
+- Curtailment loop tuning + observability, from the first real over-cap hold
+  (06.07., battery full → export held on 14256 W, setpoint 85-90 %):
+  - **Control interval 1 s → 3 s.** A 1 s loop rewrites the SMA limit before the
+    inverter has ramped to the previous one, which made the setpoint hunt ~2-3 %.
+    3 s matches the SMA ramp; the read timeout (2 s) now sits under the tick.
+  - **Per-step DEBUG tuning trace**: `export / err / WMaxLimPct / c / i` per loop,
+    silent at info. The only way to tune kp/ki against real closed-loop data on an
+    over-cap day (the offline sim has no feedback, so it can't).
+  - **"gridX write side resumed" INFO line**: edge-triggered once when external
+    writes reappear after >=10 min dry. The control-dropout signature is reads
+    alive / writes at 0; this announces when the EMS write side is back so it's
+    clear when to switch curtailment back to Modbus pass-through.
+
+## 2.3.2
+- Fail-safe now releases control instead of cutting the SMA. On lost meter
+  reads it hands the inverter back to normal operation (WMaxLim_Ena=0) rather
+  than forcing WMaxLimPct=0 — a brief over-cap during a meter outage beats
+  killing all PV, and it matches how the plant runs uncontrolled anyway.
+  The PI state is reset so control resumes clean when the meter returns.
+
 ## 2.3.1
 - Curtailment controller fixes found while validating in Simulate:
   - **Anti-windup fix:** the integral used back-calculation that wound up while
