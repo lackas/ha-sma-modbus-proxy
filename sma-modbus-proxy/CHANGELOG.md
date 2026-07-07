@@ -1,3 +1,10 @@
+## 2.4.1
+- Fix negative integral windup while free (spotted in the 2.4.0 live trace: the
+  trim wound to -786 W under the cap). The "stay free" guard only clamped the
+  trim to ≤0 instead of resetting it, so it accumulated negative while under the
+  cap — which would have delayed the next engagement until export exceeded the
+  cap by |i|, a deadband in the other direction. Now reset to 0 when free.
+
 ## 2.4.0
 - Feedforward curtailment controller — kills the engagement transient the debug
   trace exposed on 2026-07-07 (~45 s at +500..+844 W over cap while the PI

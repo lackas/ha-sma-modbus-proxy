@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -1377,8 +1377,12 @@ class _CurtailController:
         cut_w = e + self._i                                # W to shed off the SMA
         # Not cutting below current output and already free → stay free, so we
         # never report a phantom curtailment while comfortably under the cap.
+        # Reset the trim to 0 (not just clamp ≤0): letting it wind negative while
+        # free would delay the next engagement (export would have to exceed the
+        # cap by |i| before cut_w turns positive) — a deadband in the other
+        # direction, exactly what the feedforward is meant to remove.
         if cut_w <= 0.0 and self.wmax >= 100.0:
-            self._i = min(self._i, 0.0)
+            self._i = 0.0
             self.wmax = 100.0
             return 100.0, 0
         sma = self.rated if sma_now_w is None else max(0.0, float(sma_now_w))
