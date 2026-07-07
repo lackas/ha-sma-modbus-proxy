@@ -167,9 +167,7 @@ def _maybe_push_op_state(st: int) -> None:
 # at DEBUG every 5 min by inverter_poll_loop. None = not implemented by inverter.
 _last_temps: dict[str, float | None] = {"cab": None, "snk": None, "trns": None, "oth": None}
 
-# Last-read SMA AC power (W) + monotonic timestamp, updated each poll. The
-# curtailment feedforward reads this to set the limit straight from the real
-# output instead of winding an integral up through the deadband.
+# Last-read SMA AC power (W) + monotonic timestamp, read by the curtail feedforward.
 _latest_sma: dict[str, float] = {"power_w": 0.0, "ts": 0.0}
 
 # ---------------------------------------------------------------------------
@@ -1338,22 +1336,15 @@ def _write_m123_limit(client, m123_data_wire: int, unit_id: int,
 class _CurtailController:
     """Feedforward export-cap controller.
 
-    The proxy already polls the SMA's real AC output, so instead of winding a PI
-    integral up through the deadband (WMaxLimPct is % of *rated*, but the SMA
-    usually runs well below rated, so small cuts don't bind — the old design let
-    the integral crawl c down until it bit, ~45 s of over-cap plus an
-    undershoot), we set the limit straight from the measured output:
-
-        cut_w      = (export - cap) + integral_trim      # W to shed off the SMA
-        target_sma = sma_now - cut_w                     # desired SMA output
+        cut_w      = (export - cap) + integral_trim
+        target_sma = sma_now - cut_w
         WMaxLimPct = 100 * target_sma / rated
 
-    Because the feedforward gain is exactly 1 (dropping the SMA by X drops export
-    by X — the second inverter and house are just disturbances), this binds in a
-    single step and tracks the SMA ramp without windup or undershoot. A light
-    integral only trims residual bias; release is rate-limited (fast down, slow
-    up) to stay best-effort under the line. If the SMA reading is stale, rated is
-    used as a conservative fallback (over-cuts slightly, never under).
+    Drives the limit from the SMA's measured output instead of winding a PI
+    integral through the deadband. Feedforward gain is 1 (dropping the SMA by X
+    drops export by X), so it binds in one step and tracks the SMA ramp; the
+    integral only trims residual bias. Release is rate-limited (fast down, slow
+    up). Stale SMA reading falls back to rated (conservative over-cut).
     """
 
     def __init__(self, threshold_w: float, sma_rated_w: float):
@@ -1367,20 +1358,15 @@ class _CurtailController:
 
     @property
     def c(self) -> float:
-        """Curtailment amount in % (0 = free, 100 = off) — for logging/Simulate."""
+        """Curtailment amount in % (0 = free, 100 = off), for logging/Simulate."""
         return 100.0 - self.wmax
 
     def update(self, export_w: float, sma_now_w, dt: float):
         e = export_w - self.L                              # >0 = over cap
-        # Light integral trim on the residual error (Watts).
         self._i = min(self.i_clamp, max(-self.i_clamp, self._i + self.ki_w * e * dt))
         cut_w = e + self._i                                # W to shed off the SMA
-        # Not cutting below current output and already free → stay free, so we
-        # never report a phantom curtailment while comfortably under the cap.
-        # Reset the trim to 0 (not just clamp ≤0): letting it wind negative while
-        # free would delay the next engagement (export would have to exceed the
-        # cap by |i| before cut_w turns positive) — a deadband in the other
-        # direction, exactly what the feedforward is meant to remove.
+        # Free when not cutting below current output. Reset the trim (don't clamp
+        # ≤0) so it can't wind negative and delay the next engagement.
         if cut_w <= 0.0 and self.wmax >= 100.0:
             self._i = 0.0
             self.wmax = 100.0
@@ -1397,7 +1383,7 @@ class _CurtailController:
 def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
                          threshold_w, sma_rated_w, dry_run,
                          interval: float = 3.0, failsafe_after: int = 8):
-    """Best-effort export cap (~3 s loop). Never raises — self-heals on any error.
+    """Best-effort export cap (~3 s loop). Never raises, self-heals on any error.
 
     3 s matches the SMA's own ramp rate: a 1 s loop rewrites the limit before the
     inverter has reached the last one, which made the setpoint hunt ~2-3 %. At 3 s
@@ -1416,16 +1402,12 @@ def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
         try:
             export = -read_grid_export_w(tasmota_url)   # W, positive = export
             fails = 0
-            # Feedforward reads the SMA's real output from the poll thread; if it
-            # is stale (poll stalled) pass None and the controller falls back to
-            # rated (conservative over-cut).
+            # SMA output from the poll thread; stale (>10 s) → None → rated fallback.
             sma_now = _latest_sma["power_w"]
             if time.monotonic() - _latest_sma["ts"] > 10.0:
                 sma_now = None
             pct, ena = pi.update(export, sma_now, interval)
             pct_raw = min(10000, max(0, int(round(pct * 100))))
-            # Per-step tuning trace (DEBUG only): error, measured SMA power, the
-            # commanded limit and the integral trim (Watts). Silent at info.
             log.debug("[curtail] export=%.0fW err=%+.0f sma=%sW → WMaxLim=%.1f%% (i=%.0fW dt=%.1fs)",
                       export, export - threshold_w,
                       "stale" if sma_now is None else f"{sma_now:.0f}", pct, pi._i, interval)
