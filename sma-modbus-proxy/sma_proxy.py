@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.3.3"
+VERSION = "2.4.0"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -166,6 +166,11 @@ def _maybe_push_op_state(st: int) -> None:
 # Last-read Model 103 inverter temperatures (°C). Updated each poll, logged
 # at DEBUG every 5 min by inverter_poll_loop. None = not implemented by inverter.
 _last_temps: dict[str, float | None] = {"cab": None, "snk": None, "trns": None, "oth": None}
+
+# Last-read SMA AC power (W) + monotonic timestamp, updated each poll. The
+# curtailment feedforward reads this to set the limit straight from the real
+# output instead of winding an integral up through the deadband.
+_latest_sma: dict[str, float] = {"power_w": 0.0, "ts": 0.0}
 
 # ---------------------------------------------------------------------------
 # External-write handling: log + translate + forward (Modbus FC6 / FC16 from
@@ -822,6 +827,8 @@ def _poll_inverter_impl(client: ModbusTcpClient, store: ModbusDeviceContext,
     v_l3 = _safe_u16(d[10]) * 10**v_sf
 
     power = _safe_s16(d[12]) * 10**w_sf
+    _latest_sma["power_w"] = float(power)
+    _latest_sma["ts"] = time.monotonic()
     freq = _safe_u16(d[14]) * 10**hz_sf
     va = _safe_s16(d[16]) * 10**va_sf
     reactive = _safe_s16(d[18]) * 10**var_sf
@@ -1329,48 +1336,58 @@ def _write_m123_limit(client, m123_data_wire: int, unit_id: int,
 
 
 class _CurtailController:
-    """PI controller with anti-windup + asymmetric release for export capping.
+    """Feedforward export-cap controller.
 
-    State is the curtailment amount c in [0,100] % (0 = SMA free, 100 = SMA off);
-    WMaxLimPct = 100 - c. Error e = export - threshold (>0 when over cap).
+    The proxy already polls the SMA's real AC output, so instead of winding a PI
+    integral up through the deadband (WMaxLimPct is % of *rated*, but the SMA
+    usually runs well below rated, so small cuts don't bind — the old design let
+    the integral crawl c down until it bit, ~45 s of over-cap plus an
+    undershoot), we set the limit straight from the measured output:
 
-    - P term: seeded so a full-rated overshoot maps to ~full cut in one step
-      (the "one step down"); Kp = 100 / SMA_rated.
-    - I term: trims the residual — this is what "learns" the non-linear %→W
-      response and rejects the second-inverter/house disturbances. No margin:
-      setpoint is the threshold itself.
-    - Anti-windup: the integral STATE is clamped to the physical curtailment
-      range (0..100 %), so it can neither wind up while the output is saturated
-      nor carry a hidden offset while released; the deadband (limit above current
-      production → no effect) is handled by letting I walk c down until it bites.
-    - Asymmetric: reacts fast when over, releases slowly (best-effort under the
-      line without a static margin).
+        cut_w      = (export - cap) + integral_trim      # W to shed off the SMA
+        target_sma = sma_now - cut_w                     # desired SMA output
+        WMaxLimPct = 100 * target_sma / rated
 
-    Gains are initial values — tune against dry-run midday data.
+    Because the feedforward gain is exactly 1 (dropping the SMA by X drops export
+    by X — the second inverter and house are just disturbances), this binds in a
+    single step and tracks the SMA ramp without windup or undershoot. A light
+    integral only trims residual bias; release is rate-limited (fast down, slow
+    up) to stay best-effort under the line. If the SMA reading is stale, rated is
+    used as a conservative fallback (over-cuts slightly, never under).
     """
 
     def __init__(self, threshold_w: float, sma_rated_w: float):
         self.L = float(threshold_w)
-        rated = max(1000.0, float(sma_rated_w))
-        self.kp = 100.0 / rated          # % per W (full-rated overshoot → ~full cut)
-        self.ki = self.kp / 3.0          # % per (W·s) — holds the steady-state cut
-        self.release_max = 3.0           # %/s max release (slow "up")
-        self.c = 0.0
-        self._i = 0.0
+        self.rated = max(1000.0, float(sma_rated_w))
+        self.ki_w = 0.02                       # trim: extra cut (W) per (W·s) of error
+        self.i_clamp = 0.10 * self.rated       # trim bounded to ±10 % rated
+        self.release_max = 6.0                 # %/s max release (slow "up")
+        self.wmax = 100.0                      # current commanded WMaxLimPct
+        self._i = 0.0                          # integral trim, Watts
 
-    def update(self, export_w: float, dt: float):
-        e = export_w - self.L                    # >0 = over cap
-        p = self.kp * e
-        # Integral with clamping anti-windup: the state itself is bounded to the
-        # physical curtailment range (0..100 %), so it can neither wind up while
-        # saturated nor carry a hidden offset while released (which would slam
-        # the SMA the instant export first crosses the cap).
-        self._i = min(100.0, max(0.0, self._i + self.ki * e * dt))
-        c = min(100.0, max(0.0, p + self._i))
-        if c < self.c:                           # asymmetric: slow release only
-            c = max(c, self.c - self.release_max * dt)
-        self.c = min(100.0, max(0.0, c))
-        return 100.0 - self.c, (1 if self.c > 0.1 else 0)
+    @property
+    def c(self) -> float:
+        """Curtailment amount in % (0 = free, 100 = off) — for logging/Simulate."""
+        return 100.0 - self.wmax
+
+    def update(self, export_w: float, sma_now_w, dt: float):
+        e = export_w - self.L                              # >0 = over cap
+        # Light integral trim on the residual error (Watts).
+        self._i = min(self.i_clamp, max(-self.i_clamp, self._i + self.ki_w * e * dt))
+        cut_w = e + self._i                                # W to shed off the SMA
+        # Not cutting below current output and already free → stay free, so we
+        # never report a phantom curtailment while comfortably under the cap.
+        if cut_w <= 0.0 and self.wmax >= 100.0:
+            self._i = min(self._i, 0.0)
+            self.wmax = 100.0
+            return 100.0, 0
+        sma = self.rated if sma_now_w is None else max(0.0, float(sma_now_w))
+        target_sma = max(0.0, sma - cut_w)                 # desired SMA output (W)
+        desired = min(100.0, 100.0 * target_sma / self.rated)
+        if desired > self.wmax:                            # asymmetric: rate-limit release
+            desired = min(desired, self.wmax + self.release_max * dt)
+        self.wmax = min(100.0, max(0.0, desired))
+        return self.wmax, (1 if self.wmax < 99.5 else 0)
 
 
 def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
@@ -1388,20 +1405,26 @@ def curtail_control_loop(client, m123_data_wire, unit_id, tasmota_url,
     engaged = False
     last_hb = 0.0
     last_sim = None
-    log.info("[curtail] loop start: threshold=%dW dry_run=%s tasmota=%s (kp=%.4f ki=%.4f)",
-             threshold_w, dry_run, tasmota_url, pi.kp, pi.ki)
+    log.info("[curtail] loop start: threshold=%dW dry_run=%s tasmota=%s "
+             "(feedforward, rated=%.0fW ki_w=%.3f release=%.0f%%/s)",
+             threshold_w, dry_run, tasmota_url, pi.rated, pi.ki_w, pi.release_max)
     while True:
         try:
             export = -read_grid_export_w(tasmota_url)   # W, positive = export
             fails = 0
-            pct, ena = pi.update(export, interval)
+            # Feedforward reads the SMA's real output from the poll thread; if it
+            # is stale (poll stalled) pass None and the controller falls back to
+            # rated (conservative over-cut).
+            sma_now = _latest_sma["power_w"]
+            if time.monotonic() - _latest_sma["ts"] > 10.0:
+                sma_now = None
+            pct, ena = pi.update(export, sma_now, interval)
             pct_raw = min(10000, max(0, int(round(pct * 100))))
-            # Per-step tuning trace (DEBUG only): the error, the commanded limit and
-            # the internal PI split (c = total cut %, i = integral state). This is
-            # the only way to tune kp/ki against real closed-loop data on an
-            # over-cap day — silent at info/warning.
-            log.debug("[curtail] export=%.0fW err=%+.0f → WMaxLim=%.1f%% (c=%.1f i=%.1f dt=%.1fs)",
-                      export, export - threshold_w, pct, pi.c, pi._i, interval)
+            # Per-step tuning trace (DEBUG only): error, measured SMA power, the
+            # commanded limit and the integral trim (Watts). Silent at info.
+            log.debug("[curtail] export=%.0fW err=%+.0f sma=%sW → WMaxLim=%.1f%% (i=%.0fW dt=%.1fs)",
+                      export, export - threshold_w,
+                      "stale" if sma_now is None else f"{sma_now:.0f}", pct, pi._i, interval)
             if dry_run:
                 # Simulate: log + expose to a *separate* HA entity for graphing.
                 # Never writes the SMA and never touches the real curtailment

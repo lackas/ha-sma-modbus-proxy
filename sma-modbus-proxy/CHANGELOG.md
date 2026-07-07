@@ -1,3 +1,21 @@
+## 2.4.0
+- Feedforward curtailment controller — kills the engagement transient the debug
+  trace exposed on 2026-07-07 (~45 s at +500..+844 W over cap while the PI
+  integral wound up through the deadband, then a -795 W undershoot; steady state
+  was already fine). WMaxLimPct is % of *rated*, but the SMA runs well below
+  rated, so small cuts didn't bind and the integral had to crawl c down before
+  anything happened.
+  - New law drives the limit straight from the SMA's measured AC power (already
+    polled 1 Hz): `target_sma = sma_now - (export - cap)`, `WMaxLimPct =
+    100*target_sma/rated`. Feedforward gain is exactly 1 (the second inverter and
+    house are disturbances), so it binds in one step and tracks the SMA ramp
+    without windup or overshoot.
+  - Light integral trims residual bias only (Watts, ±10 % rated clamp); release
+    stays asymmetric (fast down, slow up). Stale SMA read → rated fallback
+    (conservative over-cut). "Free unless actually cutting" guard avoids phantom
+    curtailment under the cap.
+  - Debug trace now shows measured `sma=` and the integral trim in Watts.
+
 ## 2.3.3
 - Curtailment loop tuning + observability, from the first real over-cap hold
   (06.07., battery full → export held on 14256 W, setpoint 85-90 %):
