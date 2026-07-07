@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -107,13 +107,19 @@ def _push_ha_state(entity_id: str, state, attributes: dict | None = None) -> Non
         log.warning("HA push failed (%s): %s", entity_id, e)
 
 
+# Active curtailment mode, set in main(). Published as an attribute so the HA
+# lost-energy sensor knows if the VX3 is also curtailed (modbus) or only the SMA.
+_curtail_mode = "off"
+
+
 def _push_curtailment(pct_int: int, curtailed: bool) -> None:
     _push_ha_state(
         "sensor.sma_curtailment_setpoint",
         pct_int,
         {"unit_of_measurement": "%",
          "friendly_name": "SMA Curtailment Setpoint",
-         "icon": "mdi:transmission-tower-off"},
+         "icon": "mdi:transmission-tower-off",
+         "mode": _curtail_mode},
     )
     _push_ha_state(
         "binary_sensor.sma_curtailed",
@@ -1351,6 +1357,7 @@ class _CurtailController:
         self.L = float(threshold_w)
         self.rated = max(1000.0, float(sma_rated_w))
         self.ki_w = 0.02                       # trim: extra cut (W) per (W·s) of error
+        self.leak = 0.85                       # leaky integrator: forget stale bias in ~4 steps
         self.i_clamp = 0.10 * self.rated       # trim bounded to ±10 % rated
         self.release_max = 6.0                 # %/s max release (slow "up")
         self.wmax = 100.0                      # current commanded WMaxLimPct
@@ -1363,7 +1370,9 @@ class _CurtailController:
 
     def update(self, export_w: float, sma_now_w, dt: float):
         e = export_w - self.L                              # >0 = over cap
-        self._i = min(self.i_clamp, max(-self.i_clamp, self._i + self.ki_w * e * dt))
+        # Leaky integral: forgets transient excursions (e.g. a negative dip from a
+        # production crash) so stale trim can't fight the feedforward for long.
+        self._i = min(self.i_clamp, max(-self.i_clamp, self.leak * self._i + self.ki_w * e * dt))
         cut_w = e + self._i                                # W to shed off the SMA
         # Free when not cutting below current output. Reset the trim (don't clamp
         # ≤0) so it can't wind negative and delay the next engagement.
@@ -1588,6 +1597,9 @@ def main():
     if m123_data_wire is None and mode != "off":
         log.warning("curtailment=%s but Model 123 not discovered — disabled", mode)
         mode = "off"
+
+    global _curtail_mode
+    _curtail_mode = mode
 
     if mode == "modbus":
         # Pass-through: translate gridX legacy writes (40024 …) → Model 123.

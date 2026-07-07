@@ -1,3 +1,10 @@
+## 2.4.2
+- Leaky integrator (leak 0.85/step). The 2.4.1 live trace held ~+130..+280 W
+  over cap for ~90 s after a production crash: the trim had wound to -311 W
+  during the under-cap dip and, with a pure integrator, crawled back only at
+  ki_w. It now decays stale bias in ~4 steps, so it can't fight the feedforward.
+  Sim (start i=-311): reaches the cap in ~36 s vs not-in-window before.
+
 ## 2.4.1
 - Fix negative integral windup while free (spotted in the 2.4.0 live trace: the
   trim wound to -786 W under the cap). The "stay free" guard only clamped the
