@@ -74,7 +74,7 @@ def _install_connection_tracing() -> None:
     _SRH.connection_lost = _lost
     log.debug("Connection tracing installed (peer + disconnect reason)")
 
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 
 # ---------------------------------------------------------------------------
 # Home Assistant push (Supervisor API)
@@ -200,6 +200,9 @@ WMOD_ENUM = {
     1080: "Active power setpoint",
 }
 
+# Real %-curtailment register. Only writes here prove EMS control is live.
+LEGACY_WMAXLIMPCT_ADDR = 40024
+
 # Legacy SMA register metadata for human-friendly decode. These addresses are
 # what gridX writes — they do NOT exist on the STP X (ennexOS); we translate
 # them to Model 123 instead.
@@ -209,6 +212,12 @@ KNOWN_WRITE_REGS = {
         "desc": "Active power limit % (0.01 %-units), legacy SMA profile",
         "kind": "u16_pct_sf2",  # value / 100 = percent
         "expect_count": 1,
+    },
+    41218: {
+        "name": "Legacy Abs Max Power",
+        "desc": "Absolute active power limit in W (gridX startup ceiling, not a %-curtailment)",
+        "kind": "u32_watts",
+        "expect_count": 2,
     },
     40212: {
         "name": "Legacy WMod",
@@ -283,6 +292,9 @@ def _format_known_write(wire_addr: int, values: list[int]) -> str | None:
     if kind == "u32_raw" and len(values) >= 2:
         v = (values[0] << 16) | values[1]
         return f"{name} = 0x{v:08X} ({v})  — {desc}"
+    if kind == "u32_watts" and len(values) >= 2:
+        v = (values[0] << 16) | values[1]
+        return f"{name} = {v} W ({v / 1000:.3f} kW), {desc}"
     return None
 
 
@@ -597,7 +609,9 @@ class LoggingDataBlock(ModbusSequentialDataBlock):
 
     def setValues(self, address, values):
         if not LoggingDataBlock._silent:
-            _modbus_tracker.on_write()
+            is_curtail = (address == LEGACY_WMAXLIMPCT_ADDR
+                          or address + 1 == LEGACY_WMAXLIMPCT_ADDR)
+            _modbus_tracker.on_write(is_curtail=is_curtail)
             try:
                 vals = list(values) if isinstance(values, (list, tuple)) else [values]
                 # pymodbus ModbusDeviceContext has already added +1 — so ``address``
@@ -1133,7 +1147,9 @@ class _ModbusTracker:
         self._write_count = 0
         self._last_read_report = 0
         self._last_write_report = 0
-        self._write_dry_since = None  # monotonic ts since external writes went dry
+        self._curtail_write_count = 0
+        self._last_curtail_write_report = 0
+        self._curtail_dry_since = None  # dry-spell timer, curtailment writes only
         # Burst aggregator state
         self._burst_first_t = 0.0
         self._burst_last_t = 0.0
@@ -1173,8 +1189,10 @@ class _ModbusTracker:
     def on_read(self):
         self._read_count += 1
 
-    def on_write(self):
+    def on_write(self, is_curtail: bool = False):
         self._write_count += 1
+        if is_curtail:
+            self._curtail_write_count += 1
 
     def report(self):
         """Called periodically to report activity."""
@@ -1183,25 +1201,26 @@ class _ModbusTracker:
             self._flush_burst()
         rc = self._read_count
         wc = self._write_count
+        cw = self._curtail_write_count
         rd = rc - self._last_read_report
         wd = wc - self._last_write_report
+        cwd = cw - self._last_curtail_write_report
         self._last_read_report = rc
         self._last_write_report = wc
-        # Edge-triggered "gridX write side resumed": announce once when external
-        # writes reappear after a dry spell (the gridX control-dropout signature is
-        # reads alive / writes at 0). Lets the user know it's safe to switch back
-        # to Modbus pass-through mode.
+        self._last_curtail_write_report = cw
+        # "Curtailment resumed" fires only on real WMaxLimPct writes, not the
+        # abs-max ceiling write.
         now = time.monotonic()
-        if wd > 0:
-            if self._write_dry_since is not None:
-                dry_min = (now - self._write_dry_since) / 60.0
+        if cwd > 0:
+            if self._curtail_dry_since is not None:
+                dry_min = (now - self._curtail_dry_since) / 60.0
                 if dry_min >= self.WRITE_DRY_MIN:
-                    log.info("gridX write side resumed after ~%.0f min of no writes "
-                             "(+%d) — EMS control is back; safe to switch curtailment to Modbus",
-                             dry_min, wd)
-                self._write_dry_since = None
-        elif self._write_dry_since is None:
-            self._write_dry_since = now
+                    log.info("gridX curtailment writes resumed after ~%.0f min "
+                             "(+%d WMaxLimPct). EMS control is back; safe to switch "
+                             "curtailment to Modbus", dry_min, cwd)
+                self._curtail_dry_since = None
+        elif self._curtail_dry_since is None:
+            self._curtail_dry_since = now
         if rc == 0 and wc == 0:
             log.info("Modbus: idle — no client traffic")
         else:

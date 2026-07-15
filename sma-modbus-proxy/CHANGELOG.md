@@ -1,3 +1,10 @@
+## 2.4.3
+- "gridX write side resumed" no longer triggers on the abs-max ceiling write
+  (14256 W to 41218). It counted any write, so a lone startup ceiling write
+  falsely switched curtailment to Modbus (seen 2026-07-15 10:46). Now only real
+  WMaxLimPct writes (40024) count.
+- Decode the 41218 abs-max write instead of logging it as WARNING UNKNOWN.
+
 ## 2.4.2
 - Leaky integrator (leak 0.85/step). The 2.4.1 live trace held ~+130..+280 W
   over cap for ~90 s after a production crash: the trim had wound to -311 W
